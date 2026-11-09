@@ -1,0 +1,9 @@
+{
+  "name": "标准处理（柔和调色）",
+  "brightness": [-0.012, 0.012],
+  "contrast": [0.985, 1.015],
+  "saturation": [0.98, 1.02],
+  "audio_gain_db": [-0.2, 0.2],
+  "crf": 19,
+  "encoder_preset": "medium"
+}

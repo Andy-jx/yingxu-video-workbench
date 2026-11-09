@@ -1,0 +1,9 @@
+{
+  "name": "只转码（无调色）",
+  "brightness": [0, 0],
+  "contrast": [1, 1],
+  "saturation": [1, 1],
+  "audio_gain_db": [0, 0],
+  "crf": 19,
+  "encoder_preset": "medium"
+}

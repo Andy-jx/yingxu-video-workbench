@@ -1,0 +1,9 @@
+{
+  "name": "轻度处理（画面优先）",
+  "brightness": [-0.005, 0.005],
+  "contrast": [0.995, 1.005],
+  "saturation": [0.993, 1.007],
+  "audio_gain_db": [-0.1, 0.1],
+  "crf": 18,
+  "encoder_preset": "medium"
+}
