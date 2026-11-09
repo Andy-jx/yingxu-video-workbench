@@ -57,15 +57,41 @@ def probe_media(path: Path, ffprobe: str) -> dict:
               and not s.get("disposition", {}).get("attached_pic")]
     if not videos:
         raise MediaError(f"找不到可用的视频轨道: {path.name}")
-    duration = info.get("format", {}).get("duration") or videos[0].get("duration")
+    video = videos[0]
+    duration = info.get("format", {}).get("duration") or video.get("duration")
     try:
         duration = float(duration)
     except (TypeError, ValueError) as exc:
         raise MediaError("无法读取视频时长") from exc
     if not 0.01 <= duration < 7 * 24 * 3600:
         raise MediaError("视频时长无效或超过7天限制")
-    return {"duration": duration, "video": videos[0],
+    try:
+        width = int(video.get("width") or 0)
+        height = int(video.get("height") or 0)
+    except (TypeError, ValueError):
+        width = height = 0
+    if width < 2 or height < 2:
+        raise MediaError(f"无法读取视频分辨率: {path.name}")
+    return {"duration": duration, "video": video, "width": width, "height": height,
+            "fps": _frame_rate(video),
             "audio_count": sum(s.get("codec_type") == "audio" for s in info.get("streams", []))}
+
+
+def _frame_rate(video: dict) -> float:
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        raw = str(video.get(key) or "")
+        if "/" not in raw:
+            continue
+        num, den = raw.split("/", 1)
+        try:
+            den_f = float(den)
+            if den_f:
+                value = float(num) / den_f
+                if value > 1:
+                    return value
+        except ValueError:
+            continue
+    return 25.0
 
 
 class ProcessControl:
@@ -134,6 +160,21 @@ class ProcessControl:
     def check(self) -> None:
         if self.cancelled:
             raise JobCancelled("任务已取消")
+
+
+def _reject_black_output(ffmpeg: str, source: Path, output: Path, src_duration: float,
+                         out_duration: float, values: dict) -> None:
+    """Fail only when a geometry filter turns a visible frame almost black."""
+    sampled = values.get("values") or {}
+    scale = sampled.get("scale")
+    risky = ("rotate" in sampled or "crop" in values or (scale is not None and scale < 0.999))
+    if not risky:
+        return
+    from .processing import frame_luma
+    src_y = frame_luma(ffmpeg, source, src_duration * 0.4)
+    out_y = frame_luma(ffmpeg, output, max(0.0, out_duration * 0.4))
+    if src_y is not None and out_y is not None and out_y < 4 and src_y > 20:
+        raise MediaError(f"导出画面接近黑屏（亮度 {out_y:.1f}）。请减小旋转、裁剪或缩小后再试。")
 
 
 def _parse_time(value: str) -> float:
@@ -250,29 +291,38 @@ def run_job(job: JobSpec, progress: ProgressCallback | None = None,
     src = probe_media(source, ffprobe)
     control.check()
     dest.mkdir(parents=True, exist_ok=True)
-    values = _select_parameters(job)
-    video_filters, audio_filters = _make_filters(values)
     temp = dest / f".yingxu_{uuid.uuid4().hex}.tmp.mp4"
     output_base = f"{source.stem}_v{job.version:03d}"
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-n",
-               "-i", str(source), "-map", f"0:{src['video']['index']}", "-map", "0:a?",
-               *video_filters, "-c:v", "libx264", "-preset", job.preset.encoder_preset,
-               "-crf", str(job.preset.crf), "-pix_fmt", "yuv420p",
-               *audio_filters, "-c:a", "aac", "-b:a", "192k",
-               "-movflags", "+faststart", "-progress", "pipe:1", "-nostats",
-               "-f", "mp4", str(temp)]
+    if job.options is None:
+        values = _select_parameters(job)
+        video_filters, audio_filters = _make_filters(values)
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-n",
+                   "-i", str(source), "-map", f"0:{src['video']['index']}", "-map", "0:a?",
+                   *video_filters, "-c:v", "libx264", "-preset", job.preset.encoder_preset,
+                   "-crf", str(job.preset.crf), "-pix_fmt", "yuv420p",
+                   *audio_filters, "-c:a", "aac", "-b:a", "192k",
+                   "-movflags", "+faststart", "-progress", "pipe:1", "-nostats",
+                   "-f", "mp4", str(temp)]
+        expected_duration = src["duration"]
+        verify_full = job.verify_full
+    else:
+        from .processing import prepare_encode
+        command, values, expected_duration, force_verify = prepare_encode(job, src, ffmpeg, temp)
+        verify_full = job.verify_full or force_verify
     try:
         update(0, "开始编码")
-        _ffmpeg_run(command, control, src["duration"], 1, 88, "编码中", update)
+        _ffmpeg_run(command, control, expected_duration, 1, 88, "编码中", update)
         control.check()
         update(90, "检查媒体信息")
         out = probe_media(temp, ffprobe)
         if src["audio_count"] and not out["audio_count"]:
             raise MediaError("导出文件丢失了音频轨道")
-        tolerance = max(0.5, src["duration"] * 0.02)
-        if abs(src["duration"] - out["duration"]) > tolerance:
-            raise MediaError(f"导出时长不一致: 输入{src['duration']:.3f}s / 输出{out['duration']:.3f}s")
-        if job.verify_full:
+        tolerance = max(0.5, src["duration"] * 0.02) if job.options is None else max(0.35, expected_duration * 0.04)
+        if abs(expected_duration - out["duration"]) > tolerance:
+            raise MediaError(f"导出时长不一致: 预期{expected_duration:.3f}s / 输出{out['duration']:.3f}s")
+        if job.options is not None:
+            _reject_black_output(ffmpeg, source, temp, src["duration"], out["duration"], values)
+        if verify_full:
             command = [ffmpeg, "-hide_banner", "-v", "error", "-xerror", "-nostdin",
                        "-i", str(temp), "-map", "0:v:0", "-map", "0:a?",
                        "-progress", "pipe:1", "-nostats", "-f", "null", "-"]

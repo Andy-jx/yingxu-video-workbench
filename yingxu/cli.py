@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .engine import MediaError, resolve_executable
 from .models import Preset, make_jobs, preset_dir
+from .processing import load_profile
 from .queue import BatchRunner, QueueEvent
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".m4v", ".avi", ".webm", ".ts"}
@@ -23,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--versions", type=int, default=1, help="每个视频生成的版本数量，1-1000")
     p.add_argument("--seed", type=int, default=2026, help="随机种子，固定后参数可复现")
     p.add_argument("--preset", type=Path, default=preset_dir() / "标准处理.json", help="预设JSON路径")
+    p.add_argument("--profile", type=Path, help="可选：画面、音频、水印、蒙版方案 JSON")
     p.add_argument("--retries", type=int, default=1, help="失败时自动重试次数，默认1")
     p.add_argument("--verify", choices=["probe", "full"], default="full", help="probe检查轨道时长；full额外完整解码，默认full")
     p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg可执行文件路径或包含它的文件夹")
@@ -44,7 +46,9 @@ def main(argv: list[str] | None = None) -> int:
                            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS)
         sources = list(dict.fromkeys(p.resolve() for p in sources))
         preset = Preset.from_file(args.preset)
-        jobs = make_jobs(sources, args.output, args.versions, args.seed, preset, args.verify == "full")
+        profile = load_profile(args.profile) if args.profile else None
+        jobs = make_jobs(sources, args.output, args.versions, args.seed, preset,
+                         args.verify == "full", profile)
     except (ValueError, OSError, MediaError) as exc:
         print(f"参数错误：{exc}", file=sys.stderr)
         return 2
