@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
     QScrollArea, QSizePolicy, QSlider, QSpinBox, QDoubleSpinBox, QSplitter, QStackedWidget,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .engine import probe_media, resolve_executable
@@ -81,6 +81,17 @@ QRadioButton, QCheckBox { spacing: 6px; }
 QSplitter::handle { background: #16181c; }
 QScrollArea { border: none; background: #1c1e22; }
 QStatusBar { color: #b7bec8; }
+QPushButton:checked { background: #2a4a86; border-color: #5b8def; color: #ffffff; }
+QLabel#section { color: #8f9aab; font-size: 12px; font-weight: 700; padding-top: 4px; }
+QLabel#paneTitle { color: #c5ccd6; font-size: 12px; padding: 2px 4px; background: #121418; }
+QLabel#timecode { color: #d5dbe3; font-family: Consolas, "Microsoft YaHei UI"; min-width: 120px; }
+QFrame#stage { background: #0e1013; border: 1px solid #2c313a; border-radius: 4px; }
+QTabWidget::pane { border: 1px solid #3c414b; border-radius: 6px; background: #252830; top: -1px; }
+QTabBar::tab { background: #23272f; color: #aab3c0; padding: 6px 16px; border: 1px solid #3c414b; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }
+QTabBar::tab:selected { background: #252830; color: #f4f6f8; }
+QSlider::groove:horizontal { height: 4px; background: #3a404b; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #2f6fed; border-radius: 2px; }
+QSlider::handle:horizontal { background: #e7e9ee; width: 12px; height: 12px; margin: -5px 0; border-radius: 6px; }
 """
 
 
@@ -295,12 +306,117 @@ class PreviewCanvas(QWidget):
             self.regionSelected.emit(*rect)
 
 
+class VideoPane(QFrame):
+    """One real QMediaPlayer + QVideoWidget. Seeks requested before loading are applied once loaded."""
+
+    def __init__(self, title: str, with_audio: bool = True) -> None:
+        super().__init__()
+        self.setObjectName("stage")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.title = QLabel(title)
+        self.title.setObjectName("paneTitle")
+        layout.addWidget(self.title)
+        if QVideoWidget is not None:
+            self.view = QVideoWidget()
+        else:
+            self.view = QLabel("当前环境缺少 QtMultimedia，无法播放视频")
+            self.view.setAlignment(Qt.AlignCenter)
+        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.view.setMinimumHeight(120)
+        layout.addWidget(self.view, 1)
+        self.with_audio = with_audio
+        self.player = None
+        self.audio = None
+        self.path = ""
+        self._pending: int | None = None
+        self._volume = 0.8
+
+    @staticmethod
+    def available() -> bool:
+        return QMediaPlayer is not None and QVideoWidget is not None
+
+    def _ensure(self):
+        if self.player is None and self.available():
+            self.player = QMediaPlayer(self)
+            self.audio = QAudioOutput(self)
+            self.audio.setVolume(self._volume)
+            self.audio.setMuted(not self.with_audio)
+            self.player.setAudioOutput(self.audio)
+            self.player.setVideoOutput(self.view)
+            self.player.mediaStatusChanged.connect(self._on_status)
+        return self.player
+
+    def load(self, path: str, start_ms: int = 0) -> bool:
+        player = self._ensure()
+        if player is None:
+            return False
+        if path != self.path:
+            self.path = path
+            self._pending = max(0, int(start_ms))
+            player.setSource(QUrl.fromLocalFile(path))
+        else:
+            self.set_position(start_ms)
+        return True
+
+    def _on_status(self, status) -> None:
+        loaded = (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia,
+                  QMediaPlayer.MediaStatus.BufferingMedia)
+        if self._pending is not None and self.player is not None and status in loaded:
+            self.player.setPosition(self._pending)
+            self._pending = None
+
+    def set_position(self, ms: int) -> None:
+        if self.player is None:
+            return
+        if self._pending is not None:
+            self._pending = max(0, int(ms))
+        else:
+            self.player.setPosition(max(0, int(ms)))
+
+    def position(self) -> int:
+        if self.player is None:
+            return 0
+        return self._pending if self._pending is not None else int(self.player.position())
+
+    def play(self) -> None:
+        if self.player is not None:
+            self.player.play()
+
+    def pause(self) -> None:
+        if self.player is not None:
+            self.player.pause()
+
+    def is_playing(self) -> bool:
+        return self.player is not None and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+
+    def at_end(self) -> bool:
+        return self.player is not None and self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia
+
+    def set_volume(self, value: float) -> None:
+        self._volume = value
+        if self.audio is not None:
+            self.audio.setVolume(value)
+
+    def release(self) -> None:
+        """Stop and close the file so Windows can overwrite or delete it."""
+        if self.player is not None:
+            self.player.stop()
+            self.player.setSource(QUrl())
+        self.path = ""
+        self._pending = None
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("影序 · 视频处理工作台")
-        self.resize(1180, 780)
-        self.setMinimumSize(1000, 660)
+        screen = QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen else QRect(0, 0, 1366, 728)
+        self.resize(min(1680, int(area.width() * 0.92)), min(1000, int(area.height() * 0.92)))
+        self.setMinimumSize(1000, 640)
+        self._compact = area.height() < 900
         self.setAcceptDrops(True)
         self.sources: list[Path] = []
         self.media: dict[str, dict] = {}
@@ -323,7 +439,12 @@ class MainWindow(QMainWindow):
         self._token = 0
         self._preview_wanted = False
         self._playing = False
-        self.player = None
+        self.view_mode = "still"  # still | play | compare
+        self.effect_clip: dict | None = None
+        self.compare: dict | None = None
+        self._clip_serial = 0
+        self._clip_then = "compare"
+        self._single_base = 0
         self.store: WorkbenchStore | None = None
         self.log_path = Path.home() / ".yingxu" / "logs" / f"{datetime.now():%Y-%m-%d}.log"
         self.preview_dir = Path.home() / ".yingxu" / "preview"
@@ -341,43 +462,106 @@ class MainWindow(QMainWindow):
         outer = QWidget()
         self.setCentralWidget(outer)
         root = QVBoxLayout(outer)
-        root.setContentsMargins(12, 10, 12, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(10, 6, 10, 4)
+        root.setSpacing(6)
         root.addLayout(self._header())
         root.addWidget(self._action_bar())
-        body = QSplitter(Qt.Horizontal)
-        body.setChildrenCollapsible(False)
-        body.addWidget(self._left_panel())
-        body.addWidget(self._center_panel())
-        body.addWidget(self._right_panel())
-        body.setSizes([200, 520, 360])
-        root.addWidget(body, 1)
-        root.addWidget(self._queue_panel(), 0)
-        root.addWidget(self._log_panel(), 0)
+        self.body = QSplitter(Qt.Horizontal)
+        self.body.setChildrenCollapsible(False)
+        self.body.setHandleWidth(6)
+        self.body.addWidget(self._left_panel())
+        self.body.addWidget(self._center_panel())
+        self.body.addWidget(self._right_panel())
+        self.body.setStretchFactor(0, 0)
+        self.body.setStretchFactor(1, 1)
+        self.body.setStretchFactor(2, 0)
+        self.body.setSizes([200, 860, 380])
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.addTab(self._queue_panel(), "任务队列")
+        self.bottom_tabs.addTab(self._log_panel(), "运行日志")
+        self.bottom_tabs.setMinimumHeight(0)
+        self.main_split = QSplitter(Qt.Vertical)
+        self.main_split.setHandleWidth(6)
+        self.main_split.addWidget(self.body)
+        self.main_split.addWidget(self.bottom_tabs)
+        self.main_split.setCollapsible(0, False)
+        self.main_split.setCollapsible(1, True)
+        self.main_split.setStretchFactor(0, 1)
+        self.main_split.setStretchFactor(1, 0)
+        self._bottom_size = 170 if self._compact else 250
+        self.main_split.setSizes([900, self._bottom_size])
+        self.main_split.splitterMoved.connect(lambda *_: self._sync_bottom_button())
+        self._bottom_user = False
+        self._layout_compact = None
+        root.addWidget(self.main_split, 1)
         self.statusBar().showMessage("就绪 · 不覆盖原片")
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self._request_preview)
-        self.play_timer = QTimer(self)
-        self.play_timer.timeout.connect(self._advance_play)
+        self.ui_timer = QTimer(self)
+        self.ui_timer.setInterval(120)
+        self.ui_timer.timeout.connect(self._tick_playback)
         self._set_mode("single")
 
     def _header(self) -> QHBoxLayout:
         layout = QHBoxLayout()
-        text = QVBoxLayout()
-        text.setSpacing(0)
+        layout.setSpacing(12)
         title = QLabel("影序 · 视频处理工作台")
         title.setObjectName("title")
         flow = QLabel("导入视频 → 设版本数、预设和导出目录 → 加入队列 → 开始处理")
         flow.setObjectName("muted")
-        text.addWidget(title)
-        text.addWidget(flow)
-        layout.addLayout(text)
+        layout.addWidget(title)
+        layout.addWidget(flow)
         layout.addStretch()
         self.env_label = QLabel("正在检查 FFmpeg")
         self.env_label.setObjectName("muted")
         layout.addWidget(self.env_label)
+        self.bottom_button = self._button("收起队列/日志", self.toggle_bottom)
+        layout.addWidget(self.bottom_button)
         return layout
+
+    def toggle_bottom(self) -> None:
+        self._bottom_user = True
+        sizes = self.main_split.sizes()
+        if len(sizes) == 2 and sizes[1] > 8:
+            self._bottom_size = sizes[1]
+            self.main_split.setSizes([sizes[0] + sizes[1], 0])
+        else:
+            total = sum(sizes) or 900
+            keep = max(140, self._bottom_size)
+            self.main_split.setSizes([max(200, total - keep), keep])
+        self._sync_bottom_button()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        compact = self.height() < 860
+        if compact == self._layout_compact:
+            return
+        self._layout_compact = compact
+        self.source_list.setFixedHeight(52 if compact else 72)
+        if self._bottom_user:
+            return
+        sizes = self.main_split.sizes()
+        total = sum(sizes) or 900
+        if compact:
+            if len(sizes) == 2 and sizes[1] > 8:
+                self._bottom_size = max(140, sizes[1])
+            self.main_split.setSizes([total, 0])
+        else:
+            keep = max(200, self._bottom_size)
+            self.main_split.setSizes([max(200, total - keep), keep])
+        self._sync_bottom_button()
+
+    def show_bottom(self, tab: int = 0) -> None:
+        sizes = self.main_split.sizes()
+        if len(sizes) == 2 and sizes[1] <= 8:
+            self.toggle_bottom()
+        self.bottom_tabs.setCurrentIndex(tab)
+
+    def _sync_bottom_button(self) -> None:
+        sizes = self.main_split.sizes()
+        hidden = len(sizes) == 2 and sizes[1] <= 8
+        self.bottom_button.setText("展开队列/日志" if hidden else "收起队列/日志")
 
     def _action_bar(self) -> QFrame:
         frame = QFrame()
@@ -417,9 +601,12 @@ class MainWindow(QMainWindow):
     def _left_panel(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("panel")
+        frame.setMinimumWidth(180)
+        frame.setMaximumWidth(260)
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.addWidget(QLabel("工作模式"))
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        layout.addWidget(self._section("工作模式"))
         self.mode_group = QButtonGroup(self)
         for mode, text in (("single", "单视频多版本"), ("batch", "批量素材"), ("film", "成片二次处理")):
             button = QRadioButton(text)
@@ -432,71 +619,126 @@ class MainWindow(QMainWindow):
         self.mode_hint.setObjectName("hint")
         self.mode_hint.setWordWrap(True)
         layout.addWidget(self.mode_hint)
-        layout.addWidget(QLabel("功能"))
+        layout.addSpacing(4)
+        layout.addWidget(self._section("功能"))
         self.nav = QListWidget()
         for name in ("画面", "音频", "水印", "字幕蒙版", "导出"):
             self.nav.addItem(name)
-        self.nav.setFixedHeight(168)
         self.nav.setCurrentRow(0)
+        row_h = max(30, self.nav.sizeHintForRow(0))
+        self.nav.setFixedHeight(row_h * self.nav.count() + 2 * self.nav.frameWidth() + 6)
+        self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.nav.currentRowChanged.connect(self._page_changed)
         layout.addWidget(self.nav)
+        layout.addSpacing(4)
+        layout.addWidget(self._section("本批次启用"))
         self.summary_label = QLabel()
         self.summary_label.setObjectName("hint")
         self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label, 1)
+        self.summary_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        summary_scroll = QScrollArea()
+        summary_scroll.setWidgetResizable(True)
+        summary_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        summary_scroll.setWidget(self.summary_label)
+        summary_scroll.setMinimumHeight(40)
+        layout.addWidget(summary_scroll, 1)
         return frame
+
+    def _section(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("section")
+        return label
 
     def _center_panel(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("panel")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(8, 8, 8, 6)
+        layout.setSpacing(6)
+        top = QHBoxLayout()
+        top.setSpacing(6)
         self.source_list = SourceList()
-        self.source_list.setFixedHeight(84)
+        self.source_list.setFixedHeight(72)
+        self.source_list.setToolTip("支持 MP4、MOV、MKV、AVI、WEBM、M4V、TS，可拖入文件或文件夹。导入不会改原片。")
         self.source_list.filesDropped.connect(self._add_paths)
-        self.source_list.currentRowChanged.connect(lambda _row: self._schedule_preview())
-        layout.addWidget(self.source_list)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self._button("导入视频", self.import_sources))
-        buttons.addWidget(self._button("移除选中", self.remove_sources))
-        buttons.addWidget(self._button("清空", self.clear_sources))
-        buttons.addWidget(self._button("设为单独参数", self.save_override))
-        buttons.addWidget(self._button("清除单独参数", self.clear_override))
-        layout.addLayout(buttons)
-        hint = QLabel("支持 MP4、MOV、MKV、AVI、WEBM、M4V、TS，可拖入文件或文件夹。导入不会改原片。")
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self.source_list.currentRowChanged.connect(self._on_source_changed)
+        top.addWidget(self.source_list, 1)
+        file_buttons = QGridLayout()
+        file_buttons.setSpacing(4)
+        file_buttons.addWidget(self._button("导入视频", self.import_sources), 0, 0)
+        file_buttons.addWidget(self._button("移除选中", self.remove_sources), 0, 1)
+        file_buttons.addWidget(self._button("清空", self.clear_sources), 0, 2)
+        file_buttons.addWidget(self._button("设为单独参数", self.save_override), 1, 0, 1, 2)
+        file_buttons.addWidget(self._button("清除单独参数", self.clear_override), 1, 2)
+        top.addLayout(file_buttons)
+        layout.addLayout(top)
+
         self.canvas = PreviewCanvas()
-        self.canvas.setMinimumHeight(200)
+        self.canvas.setMinimumHeight(160)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.regionSelected.connect(self._on_region)
-        self.video_widget = QVideoWidget() if QVideoWidget else None
+        self.single_pane = VideoPane("原片播放")
+        self.video_widget = self.single_pane.view
+        self.cmp_left = VideoPane("原片", with_audio=False)
+        self.cmp_right = VideoPane("处理后", with_audio=True)
+        compare = QWidget()
+        compare_layout = QHBoxLayout(compare)
+        compare_layout.setContentsMargins(0, 0, 0, 0)
+        compare_layout.setSpacing(6)
+        compare_layout.addWidget(self.cmp_left, 1)
+        compare_layout.addWidget(self.cmp_right, 1)
+        self.compare_widget = compare
         self.preview_stack = QStackedWidget()
         self.preview_stack.addWidget(self.canvas)
-        if self.video_widget:
-            self.preview_stack.addWidget(self.video_widget)
+        self.preview_stack.addWidget(self.single_pane)
+        self.preview_stack.addWidget(self.compare_widget)
         layout.addWidget(self.preview_stack, 1)
+
         transport = QHBoxLayout()
-        self.original_button = self._button("原片", lambda: self._set_preview_mode("original"))
-        self.processed_button = self._button("处理后", lambda: self._set_preview_mode("processed"))
+        transport.setSpacing(6)
         self.play_button = self._button("播放", self.toggle_play)
-        transport.addWidget(self.original_button)
-        transport.addWidget(self.processed_button)
-        transport.addWidget(self._button("上一帧", lambda: self._step_frame(-1)))
+        self.play_button.setMinimumWidth(72)
         transport.addWidget(self.play_button)
+        transport.addWidget(self._button("上一帧", lambda: self._step_frame(-1)))
         transport.addWidget(self._button("下一帧", lambda: self._step_frame(1)))
-        self.clip_button = self._button("预览 3 秒效果", self.preview_clip)
-        transport.addWidget(self.clip_button)
-        transport.addStretch()
-        layout.addLayout(transport)
+        self.time_label = QLabel("00:00.00 / 00:00.00")
+        self.time_label.setObjectName("timecode")
+        transport.addWidget(self.time_label)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, 0)
         self.slider.sliderMoved.connect(self._seek)
-        layout.addWidget(self.slider)
+        transport.addWidget(self.slider, 1)
+        transport.addWidget(QLabel("音量"))
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(80)
+        self.volume_slider.setFixedWidth(90)
+        self.volume_slider.valueChanged.connect(self._set_volume)
+        transport.addWidget(self.volume_slider)
+        layout.addLayout(transport)
+
+        views = QHBoxLayout()
+        views.setSpacing(6)
+        self.original_button = self._button("原片", lambda: self._set_preview_mode("original"))
+        self.processed_button = self._button("处理后", lambda: self._set_preview_mode("processed"))
+        self.view_group = QButtonGroup(self)
+        for button in (self.original_button, self.processed_button):
+            button.setCheckable(True)
+            self.view_group.addButton(button)
+        self.original_button.setChecked(True)
+        views.addWidget(self.original_button)
+        views.addWidget(self.processed_button)
+        self.clip_button = self._button("生成 3 秒效果 · 并排对比", self.preview_clip)
+        self.clip_button.setToolTip("从当前播放位置渲染 3 秒处理后片段，左右并排与原片同步播放")
+        views.addWidget(self.clip_button)
+        self.export_compare_button = self._button("对比导出版本…", self.compare_export)
+        self.export_compare_button.setToolTip("选中队列里已完成的任务，或选择一个导出的文件，与原片左右并排同步播放")
+        views.addWidget(self.export_compare_button)
         self.preview_info = QLabel("还没有画面")
         self.preview_info.setObjectName("hint")
-        layout.addWidget(self.preview_info)
+        self.preview_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        views.addWidget(self.preview_info, 1)
+        layout.addLayout(views)
         return frame
 
     def _right_panel(self) -> QFrame:
@@ -846,9 +1088,8 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName("panel")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setContentsMargins(8, 6, 8, 6)
         toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("任务队列"))
         self.pause_btn = self._button("暂停", self.toggle_pause)
         toolbar.addWidget(self.pause_btn)
         toolbar.addWidget(self._button("取消选中", self.cancel_selected))
@@ -871,7 +1112,7 @@ class MainWindow(QMainWindow):
         for column in (1, 2, 3, 5):
             self.task_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.task_table.setColumnHidden(5, True)
-        self.task_table.setMinimumHeight(118)
+        self.task_table.setMinimumHeight(60)
         self.task_table.itemDoubleClicked.connect(lambda *_: self.show_parameters())
         layout.addWidget(self.task_table)
         return frame
@@ -880,21 +1121,16 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName("panel")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setContentsMargins(8, 6, 8, 6)
         row = QHBoxLayout()
-        self.log_toggle = QPushButton("运行日志")
-        self.log_toggle.setCheckable(True)
-        self.log_toggle.setChecked(True)
-        self.log_toggle.toggled.connect(lambda checked: self.log_edit.setVisible(checked))
-        row.addWidget(self.log_toggle)
+        row.addWidget(QLabel("运行日志（同时写入 ~/.yingxu/logs）"))
         row.addStretch()
         row.addWidget(self._button("清空日志", lambda: self.log_edit.setPlainText("")))
         layout.addLayout(row)
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
-        self.log_edit.setFixedHeight(68)
         self.log_edit.setMaximumBlockCount(1200)
-        layout.addWidget(self.log_edit)
+        layout.addWidget(self.log_edit, 1)
         return frame
 
     def _button(self, text: str, handler, primary: bool = False) -> QPushButton:
@@ -933,6 +1169,8 @@ class MainWindow(QMainWindow):
             return
         self.stack.setCurrentIndex(index)
         self._refresh_summary()
+        if index == 3 and self.view_mode != "still":
+            self._show_still("字幕蒙版：在暂停画面上按住鼠标拖动框选字幕区域")
 
     def _toggle_advanced(self, checked: bool) -> None:
         self.advanced.setVisible(checked)
@@ -957,9 +1195,8 @@ class MainWindow(QMainWindow):
 
     def _set_preview_mode(self, mode: str) -> None:
         self.preview_mode = mode
-        self._stop_player()
-        self.preview_stack.setCurrentWidget(self.canvas)
-        self._schedule_preview()
+        (self.original_button if mode == "original" else self.processed_button).setChecked(True)
+        self._show_still()
 
     def _on_form_changed(self, *_args) -> None:
         if self._loading:
@@ -1298,9 +1535,7 @@ class MainWindow(QMainWindow):
         self.media[path] = info
         current = self._preview_source()
         if current and str(current) == path:
-            duration = float(info["duration"])
-            self.slider.setRange(0, max(0, int(duration * 1000)))
-            self.preview_info.setText(f"{info['width']}×{info['height']} · {fmt_time(duration)} · {info['fps']:.2f} fps")
+            self._apply_source_info(info)
             self._schedule_preview()
 
     def _preview_source(self) -> Path | None:
@@ -1349,7 +1584,8 @@ class MainWindow(QMainWindow):
         source = self._preview_source()
         info = self.media.get(str(source), {}) if source else {}
         self.canvas.set_frame(path, int(info.get("width") or 0), int(info.get("height") or 0))
-        self.preview_stack.setCurrentWidget(self.canvas)
+        if self.view_mode == "still":
+            self.preview_stack.setCurrentWidget(self.canvas)
         duration = float(info.get("duration") or 0)
         label = "处理后" if self.preview_mode == "processed" else "原片"
         self.preview_info.setText(
@@ -1360,51 +1596,182 @@ class MainWindow(QMainWindow):
             self.preview_info.setText(message)
             self.write_log(message)
 
-    def _seek(self, value: int) -> None:
+    # ----- playback -----
+    def _duration(self) -> float:
+        source = self._preview_source()
+        info = self.media.get(str(source), {}) if source else {}
+        return float(info.get("duration") or 0)
+
+    def _apply_source_info(self, info: dict) -> None:
+        duration = float(info["duration"])
+        self.slider.setRange(0, max(0, int(duration * 1000)))
+        self.playhead = min(self.playhead, duration)
+        self.slider.setValue(int(self.playhead * 1000))
+        self._update_time_label()
+        self.preview_info.setText(f"{info['width']}×{info['height']} · {fmt_time(duration)} · {info['fps']:.2f} fps")
+
+    def _on_source_changed(self, _row: int) -> None:
+        source = self._preview_source()
+        if str(source) == getattr(self, "_last_source", None):
+            return
+        self._last_source = str(source)
         self._stop_play()
+        self.single_pane.release()
+        self.cmp_left.release()
+        self.cmp_right.release()
+        self.compare = None
+        self.view_mode = "still"
+        self.preview_stack.setCurrentWidget(self.canvas)
+        self.playhead = 0.0
+        source = self._preview_source()
+        info = self.media.get(str(source)) if source else None
+        if info:
+            self._apply_source_info(info)
+        self._schedule_preview()
+
+    def _update_time_label(self) -> None:
+        self.time_label.setText(f"{fmt_time(self.playhead)} / {fmt_time(self._duration())}")
+
+    def _set_volume(self, value: int) -> None:
+        for pane in (self.single_pane, self.cmp_left, self.cmp_right):
+            pane.set_volume(value / 100)
+
+    def _show_still(self, message: str | None = None) -> None:
+        """Pause players and show an exact FFmpeg frame; mask/crop drag-select works on it."""
+        self._stop_play()
+        self.view_mode = "still"
+        self.compare = None
+        self.preview_stack.setCurrentWidget(self.canvas)
+        if message:
+            self.preview_info.setText(message)
+        self._schedule_preview()
+
+    def _seek(self, value: int) -> None:
         self.playhead = value / 1000
+        self._update_time_label()
+        if self.view_mode == "compare" and self.compare:
+            start = self.compare["start_ms"]
+            rel = max(0, min(self.compare["length_ms"], value - start))
+            self.cmp_right.set_position(rel)
+            self.cmp_left.set_position(start + rel)
+            return
+        if self.view_mode == "play":
+            self.single_pane.set_position(max(0, value - self._single_base))
+            return
         self._schedule_preview()
 
     def _step_frame(self, direction: int) -> None:
-        self._stop_play()
+        if self.view_mode != "still":
+            self._show_still()
         source = self._preview_source()
         info = self.media.get(str(source), {}) if source else {}
         fps = float(info.get("fps") or 25)
-        self.playhead = max(0.0, self.playhead + direction / fps)
+        self.playhead = min(self._duration() or 1e9, max(0.0, self.playhead + direction / fps))
         self.slider.setValue(int(self.playhead * 1000))
+        self._update_time_label()
         self._schedule_preview()
 
     def toggle_play(self) -> None:
         if self._playing:
-            self._stop_play()
+            self._pause_playback()
             return
-        if not self._preview_source():
+        source = self._preview_source()
+        if not source:
             self.show_error("请先导入视频。")
             return
-        self._playing = True
-        self.play_button.setText("暂停")
-        self.play_timer.start(320)
+        if not VideoPane.available():
+            self.show_error("当前 Python 环境缺少 PySide6 QtMultimedia，无法播放。")
+            return
+        if self.view_mode == "compare" and self.compare:
+            if self.cmp_right.at_end():
+                self.cmp_right.set_position(0)
+                self.cmp_left.set_position(self.compare["start_ms"])
+            self.cmp_left.play()
+            self.cmp_right.play()
+            self._set_playing(True)
+            return
+        duration = self._duration()
+        if self.preview_mode == "processed":
+            clip = self.effect_clip
+            if clip and clip["source"] == str(source) and clip["start"] <= self.playhead < clip["start"] + clip["length"] - 0.05:
+                self._play_single(clip["path"], clip["start"], self.playhead, "处理后效果片段（3 秒）")
+            else:
+                self._clip_then = "single"
+                self.preview_clip()
+            return
+        if duration and self.playhead >= duration - 0.05:
+            self.playhead = 0.0
+        self._play_single(str(source), 0.0, self.playhead, "原片播放")
 
-    def _advance_play(self) -> None:
-        source = self._preview_source()
-        info = self.media.get(str(source), {}) if source else {}
-        duration = float(info.get("duration") or 0)
-        self.playhead += 0.32
-        if duration and self.playhead >= duration:
-            self.playhead = 0
-            self._stop_play()
-        self.slider.setValue(int(self.playhead * 1000))
-        self._request_preview()
+    def _play_single(self, path: str, base: float, at: float, title: str) -> None:
+        self.cmp_left.pause()
+        self.cmp_right.pause()
+        self.compare = None
+        self._single_base = int(base * 1000)
+        self.single_pane.title.setText(title)
+        self.single_pane.load(path, int((at - base) * 1000))
+        self.view_mode = "play"
+        self.preview_stack.setCurrentWidget(self.single_pane)
+        self.single_pane.play()
+        self._set_playing(True)
+
+    def _set_playing(self, playing: bool) -> None:
+        self._playing = playing
+        self.play_button.setText("暂停" if playing else "播放")
+        if playing:
+            self.ui_timer.start()
+        else:
+            self.ui_timer.stop()
+
+    def _pause_playback(self) -> None:
+        if self.view_mode == "compare":
+            self.cmp_left.pause()
+            self.cmp_right.pause()
+            self._set_playing(False)
+            self._tick_playback(force=True)
+            return
+        if self.view_mode == "play":
+            self.single_pane.pause()
+            self.playhead = (self._single_base + self.single_pane.position()) / 1000
+            self._set_playing(False)
+            self.slider.setValue(int(self.playhead * 1000))
+            self._show_still()
+            return
+        self._set_playing(False)
+
+    def _tick_playback(self, force: bool = False) -> None:
+        if self.view_mode == "compare" and self.compare:
+            start, length = self.compare["start_ms"], self.compare["length_ms"]
+            rel = self.cmp_right.position()
+            if self._playing:
+                drift = self.cmp_left.position() - (start + rel)
+                if abs(drift) > 120:
+                    self.cmp_left.set_position(start + rel)
+            position = start + rel
+            if self._playing and (self.cmp_right.at_end() or rel >= length - 40):
+                self.cmp_left.pause()
+                self.cmp_right.pause()
+                self._set_playing(False)
+        elif self.view_mode == "play":
+            position = self._single_base + self.single_pane.position()
+            if self._playing and self.single_pane.at_end():
+                self._set_playing(False)
+        else:
+            return
+        self.playhead = position / 1000
+        if not self.slider.isSliderDown():
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(position))
+            self.slider.blockSignals(False)
+        self._update_time_label()
 
     def _stop_play(self) -> None:
-        self._playing = False
-        self.play_timer.stop()
-        self.play_button.setText("播放")
-        self._stop_player()
+        for pane in (self.single_pane, self.cmp_left, self.cmp_right):
+            pane.pause()
+        self._set_playing(False)
 
     def _stop_player(self) -> None:
-        if self.player:
-            self.player.stop()
+        self._stop_play()
 
     def preview_clip(self) -> None:
         source = self._preview_source()
@@ -1415,17 +1782,33 @@ class MainWindow(QMainWindow):
         if self.thread and self.thread.isRunning():
             self.show_error("队列处理中，请先用静帧预览，避免两路编码抢占 CPU。")
             return
+        if self.clip_thread and self.clip_thread.isRunning():
+            return
         try:
             options = self._options_for(source)
         except ValueError as exc:
             self.show_error(str(exc))
             return
+        if self._playing:
+            self._pause_playback()
         duration = float(info["duration"])
-        length = min(3.0, max(0.4, duration - self.playhead))
-        output = self.preview_dir / "effect-clip.mp4"
+        start = min(self.playhead, max(0.0, duration - 0.4))
+        length = min(3.0, max(0.4, duration - start))
+        # The players may still hold the previous clip open; release it and write a new file.
+        self.single_pane.release()
+        self.cmp_right.release()
+        self._clip_serial += 1
+        output = self.preview_dir / f"effect-clip-{self._clip_serial}.mp4"
+        for old in self.preview_dir.glob("effect-clip*.mp4"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
         self.clip_button.setEnabled(False)
-        self.write_log("正在生成 3 秒效果片段…")
-        self.clip_thread = ClipThread(source, info, options, self.playhead, length, output,
+        self.preview_info.setText("正在渲染 3 秒处理后片段…")
+        self.write_log(f"正在生成 3 秒效果片段（{fmt_time(start)} 起）…")
+        self._pending_clip = {"source": str(source), "start": start, "length": length, "path": str(output)}
+        self.clip_thread = ClipThread(source, info, options, start, length, output,
                                       self._ffmpeg_path(), self._preview_seed(source))
         self.clip_thread.ok.connect(self._on_clip_ok)
         self.clip_thread.fail.connect(self._on_clip_fail)
@@ -1434,20 +1817,68 @@ class MainWindow(QMainWindow):
     def _on_clip_ok(self, path: str) -> None:
         self.clip_button.setEnabled(True)
         self.write_log(f"效果片段已生成：{path}")
-        if QMediaPlayer is None or self.video_widget is None:
+        clip = dict(self._pending_clip)
+        clip["path"] = path
+        self.effect_clip = clip
+        then, self._clip_then = self._clip_then, "compare"
+        if not VideoPane.available():
             return
-        if self.player is None:
-            self.player = QMediaPlayer(self)
-            self.player.setVideoOutput(self.video_widget)
-            self._audio = QAudioOutput(self)
-            self.player.setAudioOutput(self._audio)
-        self.preview_stack.setCurrentWidget(self.video_widget)
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.play()
+        if then == "single":
+            self._play_single(path, clip["start"], clip["start"], "处理后效果片段（3 秒）")
+        else:
+            self._start_compare(path, clip["start"], clip["length"], "处理后 · 3 秒效果片段")
 
     def _on_clip_fail(self, message: str) -> None:
         self.clip_button.setEnabled(True)
+        self._clip_then = "compare"
         self.show_error(message)
+
+    def _start_compare(self, processed: str, start: float, length: float, label: str) -> None:
+        source = self._preview_source()
+        if source is None:
+            return
+        self.single_pane.pause()
+        self.compare = {"start_ms": int(start * 1000), "length_ms": int(length * 1000), "path": processed}
+        self.cmp_left.title.setText(f"原片 · {Path(source).name}")
+        self.cmp_right.title.setText(f"{label} · 声音取自此侧")
+        self.cmp_left.load(str(source), self.compare["start_ms"])
+        self.cmp_right.load(processed, 0)
+        self.view_mode = "compare"
+        self.preview_stack.setCurrentWidget(self.compare_widget)
+        self.playhead = start
+        self.cmp_left.play()
+        self.cmp_right.play()
+        self._set_playing(True)
+        self.preview_info.setText(f"并排对比 {fmt_time(start)}–{fmt_time(start + length)}，拖动进度条两侧同步")
+
+    def compare_export(self) -> None:
+        source = self._preview_source()
+        if source is None:
+            self.show_error("请先导入并选中原片。")
+            return
+        if not VideoPane.available():
+            self.show_error("当前 Python 环境缺少 PySide6 QtMultimedia，无法播放。")
+            return
+        chosen = ""
+        for job_id in self._selected_ids():
+            spec = self.tasks.get(job_id)
+            row = self.rows.get(job_id)
+            item = self.task_table.item(row, 4) if row is not None else None
+            if spec and self.states.get(job_id) == "success" and item and Path(item.text()).is_file():
+                if str(spec.source) == str(source):
+                    chosen = item.text()
+                    break
+        if not chosen:
+            start_dir = self.output_edit.text().strip() or str(Path.home())
+            chosen, _ = QFileDialog.getOpenFileName(self, "选择要对比的导出版本", start_dir,
+                                                    "视频 (*.mp4 *.mov *.mkv);;所有文件 (*.*)")
+        if not chosen:
+            return
+        if Path(chosen).resolve() == Path(source).resolve():
+            self.show_error("请选择导出的版本，不是原片本身。")
+            return
+        duration = self._duration()
+        self._start_compare(chosen, 0.0, duration or 1.0, f"导出版本 · {Path(chosen).name}")
 
     def _on_region(self, x: float, y: float, w: float, h: float) -> None:
         page = self.stack.currentIndex()
@@ -1745,6 +2176,7 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.env_label.setText("正在处理")
         self.write_log(f"开始处理 {len(pending)} 项")
+        self.show_bottom(0)
         self.thread.start()
 
     def on_queue_event(self, event: QueueEvent) -> None:
@@ -1997,6 +2429,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "任务运行中", "请先取消全部任务并等待队列结束，再关闭窗口。")
             event.ignore()
             return
+        for pane in (self.single_pane, self.cmp_left, self.cmp_right):
+            pane.release()
         event.accept()
 
 
@@ -2009,7 +2443,10 @@ def main() -> int:
         font = QFont("WenQuanYi Micro Hei", 10)
     app.setFont(font)
     window = MainWindow()
-    window.show()
+    if "--windowed" in sys.argv:
+        window.show()
+    else:
+        window.showMaximized()
     return app.exec()
 
 
