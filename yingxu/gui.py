@@ -26,6 +26,7 @@ from .processing import (
     enabled_summary, find_cjk_font, list_video_encoders, load_profile,
     options_from_preset, render_clip, render_still, risky_warnings,
     validate_against_media, validate_options, widget_rect_to_relative, extract_frame,
+    adjacent_source,
 )
 from .queue import BatchRunner, QueueEvent
 from .store import WorkbenchStore
@@ -1457,7 +1458,12 @@ class MainWindow(QMainWindow):
             self.mask_y.setValue(y * 100)
             self.mask_w.setValue(w * 100)
             self.mask_h.setValue(h * 100)
-            self.preview_info.setText("框选已填入蒙版。确认时间后点「添加蒙版」，未添加的不会导出。")
+            sx, sy, sw, sh = adjacent_source(x, y, w, h)
+            self.mask_sx.setValue(sx * 100)
+            self.mask_sy.setValue(sy * 100)
+            self.mask_sw.setValue(sw * 100)
+            self.mask_sh.setValue(sh * 100)
+            self.preview_info.setText("框选已填入蒙版，复制来源已设为紧邻的同尺寸区域（可手动改）。确认时间后点「添加蒙版」，未添加的不会导出。")
         elif page == 0 and self.crop_enabled.isChecked() and info:
             self.crop_x.setValue(int(x * info["width"]))
             self.crop_y.setValue(int(y * info["height"]))

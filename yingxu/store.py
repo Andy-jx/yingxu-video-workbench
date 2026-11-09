@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 
 class WorkbenchStore:
@@ -32,10 +34,16 @@ class WorkbenchStore:
                 )"""
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # sqlite3's own context manager only commits; close explicitly so Windows releases the file.
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def save_preset(self, name: str, payload: dict) -> None:
         now = datetime.now().isoformat(timespec="seconds")

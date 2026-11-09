@@ -8,7 +8,7 @@ from pathlib import Path
 from yingxu.extensions import DynamicWatermarkExtension, FilterContext, SubtitleMaskExtension
 from yingxu.models import MaskSpec, Preset, ProcessOptions, RangeSpec, WatermarkSpec, make_jobs
 from yingxu.processing import (
-    build_plan, command_from_plan, enabled_summary, options_from_preset, path_position,
+    adjacent_source, build_plan, command_from_plan, enabled_summary, options_from_preset, path_position,
     sample_options, validate_options, widget_rect_to_relative,
 )
 from yingxu.store import WorkbenchStore
@@ -89,6 +89,29 @@ class ProcessingTests(unittest.TestCase):
         shown = build_plan(ProcessOptions(watermark=mark), sample_options(ProcessOptions(), 1),
                            MEDIA, preview_time=1.0, include_audio=False)
         self.assertIn("drawtext=", shown.graph)
+
+    def test_mask_and_watermark_times_follow_source_timeline_after_speed_change(self):
+        mask = MaskSpec(mode="blur", x=0.0, y=0.75, w=1.0, h=0.2, blur=8, start=5, end=8)
+        mark = WatermarkSpec(enabled=True, style="text", text="AB", start=5, end=8)
+        options = ProcessOptions(speed=RangeSpec(True, 1.25, 1.25), masks=(mask,), watermark=mark)
+        graph = plan_for(options)
+        self.assertIn("between(t,4.000,6.400)", graph)
+        self.assertNotIn("between(t,5.000,8.000)", graph)
+        clip = build_plan(ProcessOptions(masks=(mask,)), sample_options(ProcessOptions(), 1),
+                          MEDIA, time_origin=4.0, include_audio=False)
+        self.assertIn("between(t,1.000,4.000)", clip.graph)
+
+    def test_adjacent_copy_source_prefers_below_then_above(self):
+        for got, want in zip(adjacent_source(0.1, 0.5, 0.8, 0.1), (0.1, 0.61, 0.8, 0.1)):
+            self.assertAlmostEqual(got, want)
+        sx, sy, sw, sh = adjacent_source(0.1, 0.85, 0.8, 0.1)
+        self.assertAlmostEqual(sy, 0.74)
+        for got, want in zip((sx, sw, sh), (0.1, 0.8, 0.1)):
+            self.assertAlmostEqual(got, want)
+
+    def test_color_temperature_preserves_lightness(self):
+        graph = plan_for(ProcessOptions(color_temp=RangeSpec(True, 0.5, 0.5)))
+        self.assertIn("colortemperature=temperature=5250.0:pl=1", graph)
 
     def test_mask_blur_is_limited_to_its_time_span(self):
         mask = MaskSpec(mode="blur", x=0.0, y=0.75, w=1.0, h=0.2, blur=8, start=5, end=8, feather=6)

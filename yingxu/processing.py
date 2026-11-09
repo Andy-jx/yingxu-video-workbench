@@ -212,9 +212,11 @@ def build_plan(options: ProcessOptions, sampled: dict[str, float | None], media:
     out_w, out_h = _output_size(width, height, options, sampled)
     font = _resolve_font(options)
     video_filters = _linear_video_filters(options, sampled, width, height, include_timing=include_timing and preview_time is None)
-    mask_filters, out_w, out_h = _active_masks(options, preview_time, out_w, out_h)
+    # 蒙版/水印的开始结束时间按原片时间轴填写；变速或抽帧后换算到成片时间轴。
+    time_scale = tempo if (include_timing and preview_time is None) else 1.0
+    mask_filters, out_w, out_h = _active_masks(options, preview_time, out_w, out_h, time_origin, time_scale)
     wm_filters, wm_inputs, wm_label = _watermark_filters(
-        options.watermark, out_w, out_h, expected, font, preview_time, time_origin,
+        options.watermark, out_w, out_h, expected, font, preview_time, time_origin, time_scale,
     )
     audio_count = int(media.get("audio_count") or 0)
     audio_filters = []
@@ -441,6 +443,20 @@ def widget_rect_to_relative(widget_w: float, widget_h: float, frame_w: float, fr
     return left, top, right - left, bottom - top
 
 
+def adjacent_source(x: float, y: float, w: float, h: float, gap: float = 0.01) -> tuple[float, float, float, float]:
+    """Pick a same-size copy source right below the box, or above it when there is no room."""
+    w = max(0.01, min(1.0, w))
+    h = max(0.01, min(1.0, h))
+    x = max(0.0, min(1.0 - w, x))
+    below = y + h + gap
+    if below + h <= 1.0:
+        return x, below, w, h
+    above = y - gap - h
+    if above >= 0.0:
+        return x, above, w, h
+    return x, max(0.0, min(1.0 - h, y)), w, h
+
+
 def path_position(points: tuple[tuple[float, float], ...], time_sec: float, loop: float,
                   width: int, height: int) -> tuple[float, float]:
     if not points:
@@ -609,7 +625,7 @@ def _linear_video_filters(options: ProcessOptions, sampled: dict, width: int, he
     temp = sampled.get("color_temp")
     if temp is not None and abs(temp) >= 0.001:
         kelvin = max(1000.0, min(40000.0, 6500.0 - temp * 2500.0))
-        filters.append(f"colortemperature=temperature={kelvin:.1f}")
+        filters.append(f"colortemperature=temperature={kelvin:.1f}:pl=1")
     sharp = sampled.get("sharpen")
     if sharp is not None and sharp >= 0.01:
         filters.append(f"unsharp=5:5:{sharp:.4f}")
@@ -672,14 +688,15 @@ def _eq_filter(sampled: dict) -> str:
 
 
 def _active_masks(options: ProcessOptions, preview_time: float | None,
-                  width: int, height: int) -> tuple[list[str], int, int]:
+                  width: int, height: int, origin: float = 0.0,
+                  time_scale: float = 1.0) -> tuple[list[str], int, int]:
     bodies: list[str] = []
     serial = 0
     for mask in options.masks:
         if not _time_active(mask.start, mask.end, preview_time):
             continue
         rect = _pixel_rect(mask.x, mask.y, mask.w, mask.h, width, height)
-        enable = _enable_expr(mask.start, mask.end, preview_time, 0.0)
+        enable = _enable_expr(mask.start, mask.end, preview_time, origin, time_scale)
         px, py, pw, ph = rect
         serial += 1
         patch = f"p{serial}"
@@ -724,13 +741,14 @@ def _alpha_tail(feather: int, opacity: float) -> str:
 
 def _watermark_filters(mark: WatermarkSpec, width: int, height: int, duration: float,
                        font: str | None, preview_time: float | None, time_origin: float,
+                       time_scale: float = 1.0,
                        ) -> tuple[list[str], list[tuple[str, str]], str | None]:
     if not mark.enabled or not _time_active(mark.start, mark.end, preview_time):
         return [], [], None
     if _mark_kind(mark) == "text" and _needs_font(mark) and not font:
         raise ValueError("水印含中文，但没有找到字体。请在水印页指定字体文件，例如微软雅黑。")
     positions = _positions(mark, width, height, preview_time, time_origin)
-    enable = _enable_expr(mark.start, mark.end, preview_time, time_origin)
+    enable = _enable_expr(mark.start, mark.end, preview_time, time_origin, time_scale)
     if abs(mark.angle) < 0.1 and _mark_kind(mark) == "text":
         texts = [
             _drawtext(mark, font, x, y, enable if preview_time is None else None)
@@ -934,11 +952,13 @@ def _time_active(start: float, end: float, preview_time: float | None) -> bool:
     return True
 
 
-def _enable_expr(start: float, end: float, preview_time: float | None, origin: float) -> str | None:
+def _enable_expr(start: float, end: float, preview_time: float | None, origin: float,
+                 time_scale: float = 1.0) -> str | None:
     if preview_time is not None or (start <= 0 and end <= 0):
         return None
-    begin = start - origin
-    finish = end - origin if end > 0 else None
+    scale = time_scale if time_scale > 1e-6 else 1.0
+    begin = (start - origin) / scale
+    finish = (end - origin) / scale if end > 0 else None
     if finish is None:
         return None if begin <= 0 else f"gte(t,{begin:.3f})"
     return f"between(t,{begin:.3f},{finish:.3f})"
