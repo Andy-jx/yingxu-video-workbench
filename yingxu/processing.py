@@ -336,8 +336,9 @@ def build_plan(options: ProcessOptions, sampled: dict[str, float | None], media:
 def command_from_plan(ffmpeg: str, source: str, output: str, plan: FilterPlan,
                       media: dict, options: ProcessOptions, *,
                       still_time: float | None = None,
-                      clip: tuple[float, float] | None = None) -> list[str]:
-    preview = still_time is not None or clip is not None
+                      clip: tuple[float, float] | None = None,
+                      fast: bool = False) -> list[str]:
+    preview = still_time is not None or clip is not None or fast
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y" if preview else "-n"]
     if clip is not None and not plan.seek_output:
         cmd += ["-ss", f"{clip[0]:.3f}", "-t", f"{clip[1]:.3f}"]
@@ -368,16 +369,18 @@ def command_from_plan(ffmpeg: str, source: str, output: str, plan: FilterPlan,
     if still_time is not None:
         cmd += ["-frames:v", "1", "-an", output]
         return cmd
-    if clip is not None:
+    if clip is not None or fast:
         cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p"]
     else:
         cmd += _codec_args(options)
     if plan.has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "128k" if clip else "192k"]
-    if clip is None:
+        cmd += ["-c:a", "aac", "-b:a", "128k" if (clip is not None or fast) else "192k"]
+    if clip is None and not fast:
         cmd += ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats"]
-    elif plan.seek_output:
+    elif clip is not None and plan.seek_output:
         cmd += ["-ss", f"{clip[0]:.3f}", "-t", f"{clip[1]:.3f}"]
+    elif fast:
+        cmd += ["-movflags", "+faststart"]
     cmd += ["-f", "mp4", output]
     return cmd
 
@@ -399,6 +402,9 @@ def default_logo_path() -> Path:
 # 打开「图片 LOGO」时的默认组合。36px、透明度 0.30 叠在画面上几乎看不见。
 DEFAULT_LOGO_SIZE = 150
 DEFAULT_LOGO_OPACITY = 0.72
+# 固定文字沿用过同一组 36 / 0.30，白字叠在亮画面上同样看不清。
+DEFAULT_TEXT_SIZE = 72
+DEFAULT_TEXT_OPACITY = 0.92
 
 
 def apply_default_logo(options: ProcessOptions) -> ProcessOptions:
@@ -511,6 +517,85 @@ def _fit_preview(media: dict, options: ProcessOptions, max_edge: int) -> tuple[d
         speed=mark.speed * shrink,
     ))
     return fitted, options
+
+
+def output_time_to_source(output_t: float, tempo: float, inserts: list[float], hold: float,
+                          main_duration: float) -> float:
+    """Map a processed-preview timestamp back onto the original file."""
+    tempo = tempo or 1.0
+    kind, pos = locate_output_time(output_t, main_duration, list(inserts), hold)
+    if kind == "photo":
+        index = int(pos[0])
+        main_t = inserts[index] if 0 <= index < len(inserts) else main_duration
+    else:
+        main_t = float(pos)
+    return main_t * tempo
+
+
+def source_time_to_output(source_t: float, tempo: float, inserts: list[float], hold: float) -> float:
+    """Map an original-file timestamp onto the processed preview."""
+    tempo = tempo or 1.0
+    main_t = max(0.0, source_t) / tempo
+    extra = sum(hold for point in inserts if point < main_t - 1e-4)
+    return main_t + extra
+
+
+def render_preview_movie(ffmpeg: str, source: Path, media: dict, options: ProcessOptions,
+                         output: Path, seed: int, start: float = 0.0, length: float | None = None,
+                         max_edge: int = 960) -> dict:
+    """Encode one scaled movie. Playback then uses the media player instead of still frames."""
+    original = dict(media)
+    fitted_media, fitted_options = _fit_preview(dict(media), options, max_edge)
+    duration = max(0.4, float(original.get("duration") or 0.4))
+    photos = bool(fitted_options.photos.enabled and fitted_options.photos.paths)
+    if photos:
+        window_start = 0.0
+        clip_length = duration
+        clip = None
+    else:
+        window_start = max(0.0, min(float(start), max(0.0, duration - 0.4)))
+        clip_length = duration - window_start if length is None else float(length)
+        clip_length = max(0.4, min(clip_length, duration - window_start))
+        clip = (window_start, clip_length)
+    clip_media = dict(fitted_media)
+    clip_media["duration"] = clip_length
+    sampled = sample_options(fitted_options, seed)
+    plan = build_plan(
+        fitted_options, sampled, clip_media, time_origin=window_start,
+        include_timing=True, seed=seed,
+    )
+    _scale_preview_source(plan, original, fitted_media)
+    command = command_from_plan(
+        ffmpeg, str(source), str(output), plan, clip_media, fitted_options,
+        clip=clip, fast=clip is None,
+    )
+    _run(command, "预览播放失败")
+    tempo = float((plan.parameters or {}).get("tempo") or 1.0) or 1.0
+    dedup = (plan.parameters or {}).get("dedup") or {}
+    return {
+        "window_start": window_start,
+        "length": clip_length,
+        "tempo": tempo,
+        "inserts": list((plan.parameters or {}).get("photo_inserts") or []),
+        "hold": float(dedup.get("photo_hold") or 0.0),
+        "main_duration": clip_length / tempo,
+    }
+
+
+def _scale_preview_source(plan: FilterPlan, original: dict, fitted: dict) -> None:
+    """Fit the decoded frame before overlays, so preview coordinates match the smaller picture."""
+    original_w, original_h = int(original.get("width") or 0), int(original.get("height") or 0)
+    fitted_w, fitted_h = int(fitted.get("width") or 0), int(fitted.get("height") or 0)
+    if fitted_w < 2 or fitted_h < 2 or (original_w == fitted_w and original_h == fitted_h):
+        return
+    video = fitted.get("video") or original.get("video") or {}
+    label = f"0:{int(video.get('index') or 0)}"
+    scale = f"[{label}]scale={fitted_w}:{fitted_h}:flags=fast_bilinear[srcfit]"
+    if plan.graph:
+        plan.graph = scale + ";" + plan.graph.replace(f"[{label}]", "[srcfit]")
+        return
+    plan.graph = scale + ",format=yuv420p[vout]"
+    plan.vout = "vout"
 
 
 def render_clip(ffmpeg: str, source: Path, media: dict, options: ProcessOptions,
@@ -1427,8 +1512,11 @@ def _drawtext(mark: WatermarkSpec, font: str | None, x: str, y: str, enable: str
         f"text='{_escape(mark.text)}'",
         f"fontsize={mark.size}",
         f"fontcolor=white@{alpha:.3f}",
-        "borderw=1",
-        f"bordercolor=black@{min(0.65, max(alpha, 0.25)):.3f}",
+        f"borderw={max(3, int(round(mark.size * 0.12)))}",
+        "bordercolor=black@0.92",
+        f"shadowx={max(1, int(round(mark.size * 0.04)))}",
+        f"shadowy={max(1, int(round(mark.size * 0.04)))}",
+        "shadowcolor=black@0.80",
         f"x={_quote_expr(x)}",
         f"y={_quote_expr(y)}",
     ])

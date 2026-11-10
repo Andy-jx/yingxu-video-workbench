@@ -9,8 +9,9 @@ from pathlib import Path
 
 from yingxu.models import ProcessOptions, WatermarkSpec
 from yingxu.processing import (
-    apply_default_logo, default_logo_path, extract_frame, prepare_preview_options, render_still,
-    visual_effects,
+    DEFAULT_TEXT_OPACITY, DEFAULT_TEXT_SIZE, apply_default_logo, default_logo_path, extract_frame,
+    find_cjk_font, output_time_to_source, prepare_preview_options, render_preview_movie, render_still,
+    source_time_to_output, visual_effects,
 )
 
 
@@ -80,6 +81,74 @@ class PreviewTests(unittest.TestCase):
                             "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw_marked)], check=True)
             difference = max(abs(a - b) for a, b in zip(raw_plain.read_bytes(), raw_marked.read_bytes()))
             self.assertGreater(difference, 40)
+
+    def test_default_text_watermark_is_large_and_stroked(self):
+        from yingxu.processing import build_plan, sample_options
+        self.assertGreaterEqual(DEFAULT_TEXT_SIZE, 64)
+        self.assertGreaterEqual(DEFAULT_TEXT_OPACITY, 0.85)
+        media = {"width": 320, "height": 180, "duration": 2.0, "fps": 25.0,
+                 "video": {"index": 0}, "audio_count": 0}
+        options = ProcessOptions(watermark=WatermarkSpec(
+            enabled=True, style="text", text="弄好", size=DEFAULT_TEXT_SIZE, opacity=DEFAULT_TEXT_OPACITY,
+        ))
+        graph = build_plan(options, sample_options(options, 1), media, seed=1).graph
+        self.assertIn("弄好", graph)
+        self.assertIn(f"fontsize={DEFAULT_TEXT_SIZE}", graph)
+        self.assertNotIn("borderw=1", graph)
+        self.assertIn("borderw=", graph)
+        self.assertAlmostEqual(source_time_to_output(2.0, 2.0, [], 0.0), 1.0)
+        self.assertAlmostEqual(output_time_to_source(1.0, 2.0, [], 0.0, 5.0), 2.0)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and find_cjk_font(), "requires FFmpeg and a CJK font")
+    def test_default_text_watermark_is_visible_on_a_frame(self):
+        ffmpeg = shutil.which("ffmpeg")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "gray.mp4"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "color=c=0x808080:s=320x180:d=0.2",
+                            "-frames:v", "1", str(source)], check=True)
+            from yingxu.engine import probe_media
+            media = probe_media(source, shutil.which("ffprobe"))
+            plain = root / "plain.png"
+            marked = root / "text.png"
+            extract_frame(ffmpeg, source, 0, plain)
+            render_still(ffmpeg, source, media, ProcessOptions(
+                font=find_cjk_font() or "",
+                watermark=WatermarkSpec(
+                    enabled=True, style="text", text="弄好", size=DEFAULT_TEXT_SIZE,
+                    opacity=DEFAULT_TEXT_OPACITY, x=0.04, y=0.06,
+                ),
+            ), 0, marked, 1, max_edge=0)
+            raw_plain = root / "a.raw"
+            raw_marked = root / "b.raw"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(plain),
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw_plain)], check=True)
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(marked),
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw_marked)], check=True)
+            difference = max(abs(a - b) for a, b in zip(raw_plain.read_bytes(), raw_marked.read_bytes()))
+            self.assertGreater(difference, 40)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "requires FFmpeg")
+    def test_preview_playback_exports_a_movie(self):
+        ffmpeg = shutil.which("ffmpeg")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "gray.mp4"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "color=c=0x406080:s=320x180:d=0.4",
+                            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                            "-shortest", str(source)], check=True)
+            from yingxu.engine import probe_media
+            media = probe_media(source, shutil.which("ffprobe"))
+            output = root / "preview.mp4"
+            info = render_preview_movie(ffmpeg, source, media, ProcessOptions(watermark=WatermarkSpec(
+                enabled=True, style="text", text="弄好", size=DEFAULT_TEXT_SIZE, opacity=DEFAULT_TEXT_OPACITY,
+                font=find_cjk_font() or "",
+            )), output, 1)
+            self.assertGreater(output.stat().st_size, 1000)
+            self.assertGreater(info["length"], 0.2)
+            self.assertEqual(output.suffix, ".mp4")
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "requires FFmpeg")
     def test_still_preview_shows_watermark_and_photo_insert(self):

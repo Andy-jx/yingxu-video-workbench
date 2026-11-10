@@ -3,18 +3,17 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
     QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
+    QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
     QScrollArea, QSizePolicy, QSlider, QSpinBox, QDoubleSpinBox, QSplitter, QStackedWidget,
     QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -25,10 +24,12 @@ from .models import (
     RangeSpec, WatermarkSpec, make_jobs, preset_dir,
 )
 from .processing import (
-    DEFAULT_LOGO_OPACITY, DEFAULT_LOGO_SIZE, adjacent_source, apply_default_logo, default_logo_path,
+    DEFAULT_LOGO_OPACITY, DEFAULT_LOGO_SIZE, DEFAULT_TEXT_OPACITY, DEFAULT_TEXT_SIZE,
+    adjacent_source, apply_default_logo, default_logo_path,
     enabled_summary, extract_frame,
-    find_cjk_font, list_video_encoders, load_profile, options_from_preset, prepare_preview_options,
-    render_clip, render_still, risky_warnings, validate_against_media, validate_options,
+    find_cjk_font, list_video_encoders, load_profile, options_from_preset, output_time_to_source,
+    prepare_preview_options, render_clip, render_preview_movie, render_still, risky_warnings,
+    source_time_to_output, validate_against_media, validate_options,
     visual_effects, widget_rect_to_relative,
 )
 from .queue import BatchRunner, QueueEvent
@@ -182,6 +183,36 @@ class ClipThread(QThread):
             self.ok.emit(str(output))
         except Exception as exc:
             self.fail.emit(str(exc))
+
+
+class ProxyThread(QThread):
+    """One scaled movie for smooth playback. The UI must not repaint stills while this plays."""
+
+    ok = Signal(int, str, object)
+    fail = Signal(int, str)
+
+    def __init__(self, token: int, source: Path, media: dict, options: ProcessOptions,
+                 output: Path, ffmpeg: str, seed: int, start: float, length: float) -> None:
+        super().__init__()
+        self.token = token
+        self.source = source
+        self.media = media
+        self.options = options
+        self.output = output
+        self.ffmpeg = ffmpeg
+        self.seed = seed
+        self.clip_start = start
+        self.clip_length = length
+
+    def run(self) -> None:
+        try:
+            info = render_preview_movie(
+                self.ffmpeg, self.source, self.media, self.options, self.output, self.seed,
+                start=self.clip_start, length=self.clip_length,
+            )
+            self.ok.emit(self.token, str(self.output), info)
+        except Exception as exc:
+            self.fail.emit(self.token, str(exc))
 
 
 class SourceList(QListWidget):
@@ -435,10 +466,17 @@ class MainWindow(QMainWindow):
         self.mask_target: str | None = None
         self._mask_preview = False
         self._applying_mask = False
-        self._last_live = 0.0
+        self._proxy_play = False
+        self._awaiting_proxy = False
+        self._proxy_autostart = False
+        self._proxy_token = 0
+        self._proxy_info: dict | None = None
+        self._proxy_cache: dict[str, dict] = {}
+        self._proxy_pending_signature = ""
         self.thread: QueueThread | None = None
         self.preview_thread: PreviewThread | None = None
         self.clip_thread: ClipThread | None = None
+        self.proxy_thread: ProxyThread | None = None
         self.probe_thread: ProbeThread | None = None
         self.probe_queue: list[str] = []
         self.is_paused = False
@@ -508,6 +546,9 @@ class MainWindow(QMainWindow):
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self._request_preview)
+        self.proxy_timer = QTimer(self)
+        self.proxy_timer.setSingleShot(True)
+        self.proxy_timer.timeout.connect(self._refresh_playing_proxy)
         self.ui_timer = QTimer(self)
         self.ui_timer.setInterval(120)
         self.ui_timer.timeout.connect(self._tick_playback)
@@ -678,8 +719,6 @@ class MainWindow(QMainWindow):
         file_buttons.addWidget(self._button("导入视频", self.import_sources), 0, 0)
         file_buttons.addWidget(self._button("移除选中", self.remove_sources), 0, 1)
         file_buttons.addWidget(self._button("清空", self.clear_sources), 0, 2)
-        file_buttons.addWidget(self._button("记住这条", self.save_override), 1, 0, 1, 2)
-        file_buttons.addWidget(self._button("取消记住", self.clear_override), 1, 2)
         top.addLayout(file_buttons)
         layout.addLayout(top)
 
@@ -905,7 +944,7 @@ class MainWindow(QMainWindow):
         self.wm_enabled = QCheckBox("启用水印")
         self.wm_enabled.toggled.connect(self._watermark_toggled)
         layout.addWidget(self.wm_enabled)
-        note = QLabel("改完预览马上变。图片 LOGO 不选文件就用内置标志，也可以自己换。平铺把透明度降到 0.2 左右。")
+        note = QLabel("改完右边，暂停画面和点播放看到的是同一套。图片 LOGO 不选文件就用内置标志。平铺把透明度降到 0.2 左右。")
         note.setWordWrap(True)
         note.setObjectName("hint")
         layout.addWidget(note)
@@ -1214,6 +1253,12 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._button("取消选中", self.cancel_selected))
         toolbar.addWidget(self._button("取消全部", self.cancel_all))
         toolbar.addWidget(self._button("重试失败", self.retry_selected))
+        clear_button = QPushButton("清空")
+        clear_menu = QMenu(clear_button)
+        clear_menu.addAction("清空已完成", self.clear_finished)
+        clear_menu.addAction("清空全部", self.clear_all_jobs)
+        clear_button.setMenu(clear_menu)
+        toolbar.addWidget(clear_button)
         toolbar.addStretch()
         self.count_label = QLabel("0 项")
         self.count_label.setObjectName("hint")
@@ -1232,7 +1277,12 @@ class MainWindow(QMainWindow):
             self.task_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.task_table.setColumnHidden(5, True)
         self.task_table.setMinimumHeight(60)
+        self.task_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.task_table.customContextMenuRequested.connect(self._task_menu)
         self.task_table.itemDoubleClicked.connect(lambda *_: self.show_parameters())
+        delete_key = QShortcut(QKeySequence(Qt.Key_Delete), self.task_table)
+        delete_key.setContext(Qt.WidgetWithChildrenShortcut)
+        delete_key.activated.connect(self.delete_selected_jobs)
         layout.addWidget(self.task_table)
         return frame
 
@@ -1324,6 +1374,7 @@ class MainWindow(QMainWindow):
         if self._loading:
             return
         self._mark_custom()
+        self._sync_live_overrides()
         self._refresh_summary()
         if self._effects_on():
             self.preview_mode = "processed"
@@ -1331,10 +1382,12 @@ class MainWindow(QMainWindow):
             if self.view_mode == "compare":
                 self._show_still()
                 return
-            if self.view_mode == "play":
-                self.preview_stack.setCurrentWidget(self.canvas)
-                self._request_preview()
+            if self.view_mode == "play" or self._awaiting_proxy:
+                self._schedule_proxy_refresh()
                 return
+        elif self.view_mode == "play" or self._awaiting_proxy:
+            self._schedule_proxy_refresh()
+            return
         self._schedule_preview()
 
     def _effects_on(self) -> bool:
@@ -1344,7 +1397,12 @@ class MainWindow(QMainWindow):
             return False
 
     def _preview_options(self) -> ProcessOptions:
-        options = apply_default_logo(self.collect_options(validate=False))
+        source = self._preview_source()
+        if source is not None:
+            options = self._options_for(source, validate=False)
+        else:
+            options = self.collect_options(validate=False)
+        options = apply_default_logo(options)
         draft = None
         try:
             draft = self._mask_from_form()
@@ -1383,15 +1441,27 @@ class MainWindow(QMainWindow):
             return
         style = self.wm_style.currentData()
         self._loading = True
+        faint = self.wm_size.value() <= 48 and self.wm_opacity.value() <= 0.35
+        text_default = (
+            self.wm_size.value() == DEFAULT_TEXT_SIZE
+            and abs(self.wm_opacity.value() - DEFAULT_TEXT_OPACITY) < 0.02
+        )
         if style == "image":
             if not self.wm_image.text().strip():
                 self.wm_image.setText(str(default_logo_path()))
-            # 36 / 0.30 是文字水印的默认值，叠内置标志时几乎看不见。
-            if self.wm_size.value() <= 48 and self.wm_opacity.value() <= 0.35:
+            # 36 / 0.30 和文字默认值叠在画面上都不适合当标志。
+            if faint or text_default:
                 self.wm_size.setValue(DEFAULT_LOGO_SIZE)
                 self.wm_opacity.setValue(DEFAULT_LOGO_OPACITY)
-        elif style not in {"image", "path"} and not self.wm_text.text().strip():
-            self.wm_text.setText("影序")
+        elif style == "translucent":
+            if not self.wm_text.text().strip():
+                self.wm_text.setText("影序")
+        elif style != "path":
+            if not self.wm_text.text().strip():
+                self.wm_text.setText("影序")
+            if faint:
+                self.wm_size.setValue(DEFAULT_TEXT_SIZE)
+                self.wm_opacity.setValue(DEFAULT_TEXT_OPACITY)
         self._loading = False
 
     def _on_mask_edited(self, *_args) -> None:
@@ -1410,7 +1480,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_summary(self) -> None:
         try:
-            options = self.collect_options(validate=False)
+            source = self._preview_source()
+            if source is not None:
+                options = self._options_for(source, validate=False)
+            else:
+                options = self.collect_options(validate=False)
             text = "、".join(enabled_summary(options))
             warnings = risky_warnings(options)
         except ValueError as exc:
@@ -1684,8 +1758,6 @@ class MainWindow(QMainWindow):
         for path in self.sources:
             label = path.name if names.count(path.name) == 1 else f"{path.name}  —  {path.parent.name}"
             tags = []
-            if str(path) in self.overrides:
-                tags.append("单独设置")
             if str(path) in self.source_masks:
                 tags.append(f"蒙版{len(self.source_masks[str(path)])}段")
             if tags:
@@ -1921,6 +1993,9 @@ class MainWindow(QMainWindow):
 
     def _show_still(self, message: str | None = None) -> None:
         """Pause players and show an exact FFmpeg frame; mask/crop drag-select works on it."""
+        self._proxy_autostart = False
+        self._proxy_play = False
+        self._awaiting_proxy = False
         self._stop_play()
         self.view_mode = "still"
         self.compare = None
@@ -1938,11 +2013,13 @@ class MainWindow(QMainWindow):
             self.cmp_right.set_position(rel)
             self.cmp_left.set_position(start + rel)
             return
+        if self._proxy_play and self.view_mode == "play":
+            self.single_pane.set_position(self._proxy_position_ms(self.playhead))
+            return
+        if self._awaiting_proxy:
+            return
         if self.view_mode == "play":
             self.single_pane.set_position(max(0, value - self._single_base))
-            if self.preview_mode == "processed":
-                self.preview_stack.setCurrentWidget(self.canvas)
-                self._request_preview()
             return
         self._schedule_preview()
 
@@ -1978,25 +2055,131 @@ class MainWindow(QMainWindow):
             return
         duration = self._duration()
         if self.preview_mode == "processed" and self._effects_on():
-            self._play_live_effects(source)
+            self._play_processed(source)
             return
         if duration and self.playhead >= duration - 0.05:
             self.playhead = 0.0
+        self._proxy_play = False
+        self._awaiting_proxy = False
         self._play_single(str(source), 0.0, self.playhead, "原片播放")
 
-    def _play_live_effects(self, source: Path) -> None:
-        """Play source audio while the canvas keeps redrawing the processed frame."""
+    def _schedule_proxy_refresh(self) -> None:
+        self.proxy_timer.start(280)
+
+    def _refresh_playing_proxy(self) -> None:
+        source = self._preview_source()
+        if source is None:
+            return
+        if self.preview_mode == "processed" and self._effects_on():
+            self._play_processed(source)
+            return
+        self._proxy_play = False
+        self._awaiting_proxy = False
+        self._play_single(str(source), 0.0, self.playhead, "原片播放")
+
+    def _proxy_window(self, duration: float, options: ProcessOptions) -> tuple[float, float]:
+        if options.photos.enabled and options.photos.paths:
+            return 0.0, max(0.4, duration)
+        if duration <= 240:
+            return 0.0, max(0.4, duration)
+        start = min(self.playhead, max(0.0, duration - 0.4))
+        return start, min(90.0, max(0.4, duration - start))
+
+    def _proxy_signature(self, source: Path, options: ProcessOptions, start: float, length: float) -> str:
+        return json.dumps({
+            "source": str(source), "seed": self._preview_seed(source),
+            "start": round(start, 3), "length": round(length, 3),
+            "options": options.to_dict(),
+        }, ensure_ascii=False, sort_keys=True)
+
+    def _play_processed(self, source: Path) -> None:
+        """Play one rendered movie of the current effects. Do not step through still frames."""
+        info = self.media.get(str(source))
+        if not info:
+            self.preview_info.setText("正在读取视频信息…")
+            return
+        try:
+            options = prepare_preview_options(apply_default_logo(self._options_for(source)))
+        except ValueError as exc:
+            self.preview_info.setText(str(exc))
+            return
+        duration = float(info.get("duration") or 0.4)
+        start, length = self._proxy_window(duration, options)
+        signature = self._proxy_signature(source, options, start, length)
+        self._proxy_autostart = True
+        self.view_mode = "play"
+        self.compare = None
+        cached = self._proxy_cache.get(signature)
+        if cached and Path(cached["path"]).is_file() and Path(cached["path"]).stat().st_size > 0:
+            self._proxy_info = cached
+            self._awaiting_proxy = False
+            self._begin_proxy_playback()
+            return
+        self._awaiting_proxy = True
+        self._proxy_play = False
+        self.single_pane.pause()
         self.cmp_left.pause()
         self.cmp_right.pause()
-        self.compare = None
-        self._single_base = 0
         self.preview_stack.setCurrentWidget(self.canvas)
-        self.view_mode = "play"
-        self.single_pane.load(str(source), int(self.playhead * 1000))
-        self.single_pane.play()
+        self._proxy_token += 1
+        token = self._proxy_token
+        self._proxy_pending_signature = signature
+        output = self.preview_dir / f"play-{token}.mp4"
+        self.preview_info.setText("正在准备带效果的播放…")
         self._set_playing(True)
-        self._last_live = 0.0
-        self._request_preview()
+        self.proxy_thread = ProxyThread(
+            token, source, info, options, output, self._ffmpeg_path(), self._preview_seed(source), start, length,
+        )
+        self.proxy_thread.ok.connect(self._on_proxy_ok)
+        self.proxy_thread.fail.connect(self._on_proxy_fail)
+        self.proxy_thread.start()
+
+    def _on_proxy_ok(self, token: int, path: str, info: object) -> None:
+        if token != self._proxy_token or not isinstance(info, dict):
+            return
+        payload = dict(info)
+        payload["path"] = path
+        self._proxy_cache[self._proxy_pending_signature] = payload
+        self._proxy_info = payload
+        if self._proxy_autostart:
+            self._begin_proxy_playback()
+
+    def _on_proxy_fail(self, token: int, message: str) -> None:
+        if token != self._proxy_token:
+            return
+        self._awaiting_proxy = False
+        self._proxy_autostart = False
+        self._set_playing(False)
+        self.preview_info.setText(message)
+        self.write_log(message)
+
+    def _begin_proxy_playback(self) -> None:
+        info = self._proxy_info
+        if not info or not self._proxy_autostart:
+            return
+        self._awaiting_proxy = False
+        self._proxy_play = True
+        position = self._proxy_position_ms(self.playhead)
+        self._play_single(str(info["path"]), 0.0, position / 1000.0, "处理后")
+        self.preview_info.setText("正在播放处理后的画面")
+
+    def _source_time_from_proxy(self, player_ms: int) -> float:
+        info = self._proxy_info or {}
+        relative = output_time_to_source(
+            max(0.0, player_ms / 1000.0), float(info.get("tempo") or 1),
+            list(info.get("inserts") or []), float(info.get("hold") or 0),
+            float(info.get("main_duration") or 0),
+        )
+        return float(info.get("window_start") or 0) + relative
+
+    def _proxy_position_ms(self, source_time: float) -> int:
+        info = self._proxy_info or {}
+        relative = max(0.0, source_time - float(info.get("window_start") or 0))
+        output_t = source_time_to_output(
+            relative, float(info.get("tempo") or 1),
+            list(info.get("inserts") or []), float(info.get("hold") or 0),
+        )
+        return max(0, int(output_t * 1000))
 
     def _play_single(self, path: str, base: float, at: float, title: str) -> None:
         self.cmp_left.pause()
@@ -2025,9 +2208,18 @@ class MainWindow(QMainWindow):
             self._set_playing(False)
             self._tick_playback(force=True)
             return
+        if self._awaiting_proxy:
+            self._proxy_autostart = False
+            self._awaiting_proxy = False
+            self._set_playing(False)
+            self._show_still()
+            return
         if self.view_mode == "play":
             self.single_pane.pause()
-            self.playhead = (self._single_base + self.single_pane.position()) / 1000
+            if self._proxy_play:
+                self.playhead = self._source_time_from_proxy(self.single_pane.position())
+            else:
+                self.playhead = (self._single_base + self.single_pane.position()) / 1000
             self._set_playing(False)
             self.slider.setValue(int(self.playhead * 1000))
             self._show_still()
@@ -2035,6 +2227,8 @@ class MainWindow(QMainWindow):
         self._set_playing(False)
 
     def _tick_playback(self, force: bool = False) -> None:
+        if self._awaiting_proxy:
+            return
         if self.view_mode == "compare" and self.compare:
             start, length = self.compare["start_ms"], self.compare["length_ms"]
             rel = self.cmp_right.position()
@@ -2047,14 +2241,17 @@ class MainWindow(QMainWindow):
                 self.cmp_left.pause()
                 self.cmp_right.pause()
                 self._set_playing(False)
+        elif self.view_mode == "play" and self._proxy_play:
+            position = self._source_time_from_proxy(self.single_pane.position()) * 1000
+            if self._playing and self.single_pane.at_end():
+                self.playhead = position / 1000
+                self._set_playing(False)
+                self._show_still()
+                return
         elif self.view_mode == "play":
             position = self._single_base + self.single_pane.position()
             if self._playing and self.single_pane.at_end():
                 self._set_playing(False)
-            if self.preview_mode == "processed" and time.monotonic() - self._last_live > 0.16:
-                self._last_live = time.monotonic()
-                self.preview_stack.setCurrentWidget(self.canvas)
-                self._request_preview()
         else:
             return
         self.playhead = position / 1000
@@ -2360,6 +2557,7 @@ class MainWindow(QMainWindow):
         self._loading = False
 
     def save_override(self) -> None:
+        """Remember these clips, then keep the copy live. Later edits replace it."""
         selected = self._selected_sources() or ([self._preview_source()] if self._preview_source() else [])
         if not selected:
             self.show_error("请先选中素材。")
@@ -2369,14 +2567,33 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self.show_error(str(exc))
             return
+        payload = options.to_dict()
         for path in selected:
             key = self._source_key(path)
-            payload = options.to_dict()
+            if not key:
+                continue
+            stored = dict(payload)
             if key in self.source_masks:
-                payload["masks"] = self.source_masks[key]
-            self.overrides[key] = payload
+                stored["masks"] = self.source_masks[key]
+            self.overrides[key] = stored
         self._refresh_source_list()
-        self.write_log(f"已记住 {len(selected)} 条自己的颜色和水印。之后改蒙版仍会写进这些条。")
+        self.write_log(f"已记下 {len(selected)} 条。右侧再改水印、画面或蒙版，会直接更新到这些条。")
+
+    def _sync_live_overrides(self) -> None:
+        if not self.overrides:
+            return
+        try:
+            payload = self.collect_options(validate=False).to_dict()
+        except ValueError:
+            return
+        current = self._source_key(self._preview_source())
+        for key in list(self.overrides):
+            updated = dict(payload)
+            if key in self.source_masks:
+                updated["masks"] = self.source_masks[key]
+            elif key != current:
+                updated["masks"] = self.overrides[key].get("masks") or []
+            self.overrides[key] = updated
 
     def clear_override(self) -> None:
         for path in self._selected_sources():
@@ -2398,23 +2615,27 @@ class MainWindow(QMainWindow):
             raise ValueError("请先导入至少一个视频")
         return list(self.sources)
 
-    def _options_for(self, source: Path) -> ProcessOptions:
+    def _options_for(self, source: Path, validate: bool = True) -> ProcessOptions:
         key = self._source_key(source)
-        raw = self.overrides.get(key)
+        current = self._source_key(self._preview_source())
+        # The clip on screen always follows the form. A saved copy cannot hide later edits.
+        raw = None if key == current else self.overrides.get(key)
         if raw:
             options = ProcessOptions.from_dict(raw)
             if self.mode == "film":
                 options = self._strip_film(options)
         else:
-            options = self.collect_options()
-        if key in self.source_masks:
-            options = replace(options, masks=tuple(MaskSpec.from_dict(item) for item in self.source_masks[key]))
-        elif raw is None:
-            options = replace(options, masks=tuple(self.shared_masks))
-        validate_options(options)
-        info = self.media.get(str(source))
-        if info:
-            validate_against_media(options, int(info["width"]), int(info["height"]))
+            options = self.collect_options(validate=False)
+        if key != current:
+            if key in self.source_masks:
+                options = replace(options, masks=tuple(MaskSpec.from_dict(item) for item in self.source_masks[key]))
+            elif raw is None:
+                options = replace(options, masks=tuple(self.shared_masks))
+        if validate:
+            validate_options(options)
+            info = self.media.get(str(source)) or (self.media.get(key) if key else None)
+            if info:
+                validate_against_media(options, int(info["width"]), int(info["height"]))
         return options
 
     def _preset_for_form(self) -> Preset:
@@ -2661,6 +2882,139 @@ class MainWindow(QMainWindow):
                 count += 1
         self.write_log(f"重新排队 {count} 项")
 
+    def clear_finished(self) -> None:
+        done = [job_id for job_id, state in self.states.items() if state in {"success", "failed", "cancelled"}]
+        if not done:
+            self.write_log("没有已结束的任务")
+            return
+        self._drop_jobs(done)
+
+    def clear_all_jobs(self) -> None:
+        if not self.tasks:
+            self.write_log("队列是空的")
+            return
+        self._drop_jobs(list(self.tasks))
+
+    def delete_selected_jobs(self) -> None:
+        ids = self._selected_ids()
+        if not ids:
+            return
+        self._drop_jobs(ids)
+
+    def _drop_jobs(self, ids: list[str]) -> None:
+        chosen = [job_id for job_id in ids if job_id in self.tasks]
+        if not chosen:
+            return
+        active = [job_id for job_id in chosen if self.states.get(job_id) in {"queued", "running", "paused", "retrying"}]
+        if active and self.thread and self.thread.isRunning():
+            self.thread.runner.cancel(active)
+        for job_id in chosen:
+            self.tasks.pop(job_id, None)
+            self.states.pop(job_id, None)
+            self.results.pop(job_id, None)
+        self._rebuild_task_table()
+        self._update_count()
+        self.write_log(f"已从队列移除 {len(chosen)} 项，没有删除成片文件")
+
+    def _rebuild_task_table(self) -> None:
+        snapshot = []
+        for job_id, spec in list(self.tasks.items()):
+            row = self.rows.get(job_id)
+            output = "—"
+            percent = 0
+            if row is not None:
+                item = self.task_table.item(row, 4)
+                output = item.text() if item else "—"
+                bar = self.task_table.cellWidget(row, 3)
+                if isinstance(bar, QProgressBar):
+                    percent = bar.value()
+            snapshot.append((spec, self.states.get(job_id, "queued"), output, percent))
+        self.task_table.setRowCount(0)
+        self.rows.clear()
+        self.tasks.clear()
+        for spec, state, output, percent in snapshot:
+            self._add_row(spec)
+            self.states[spec.job_id] = state
+            row = self.rows[spec.job_id]
+            self.task_table.item(row, 2).setText(STATE_LABELS.get(state, state))
+            self.task_table.item(row, 4).setText(output)
+            bar = self.task_table.cellWidget(row, 3)
+            if isinstance(bar, QProgressBar):
+                bar.setValue(percent)
+
+    def _task_menu(self, pos) -> None:
+        index = self.task_table.indexAt(pos)
+        if index.isValid():
+            selected = {item.row() for item in self.task_table.selectionModel().selectedRows()}
+            if index.row() not in selected:
+                self.task_table.selectRow(index.row())
+        self._build_task_menu().exec(self.task_table.viewport().mapToGlobal(pos))
+
+    def _build_task_menu(self) -> QMenu:
+        menu = QMenu(self.task_table)
+        menu.addAction("删除选中", self.delete_selected_jobs)
+        menu.addAction("打开输出目录", self.open_selected_output_dir)
+        menu.addAction("打开成片", self.open_selected_outputs)
+        menu.addSeparator()
+        menu.addAction("删除成片文件…", self.delete_selected_files)
+        return menu
+
+    def _selected_outputs(self) -> list[Path]:
+        paths = []
+        for job_id in self._selected_ids():
+            row = self.rows.get(job_id)
+            item = self.task_table.item(row, 4) if row is not None else None
+            text = item.text().strip() if item else ""
+            if text and text != "—":
+                paths.append(Path(text))
+        return paths
+
+    def open_selected_output_dir(self) -> None:
+        folder = None
+        for path in self._selected_outputs():
+            if path.is_file():
+                folder = path.parent
+                break
+            if path.parent.is_dir():
+                folder = path.parent
+                break
+        if folder is None:
+            text = self.output_edit.text().strip()
+            if text and Path(text).is_dir():
+                folder = Path(text)
+        if folder is None:
+            self.show_error("还没有可以打开的输出目录。")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def open_selected_outputs(self) -> None:
+        files = [path for path in self._selected_outputs() if path.is_file()]
+        if not files:
+            self.show_error("选中的任务还没有成片。")
+            return
+        for path in files:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def delete_selected_files(self) -> None:
+        files = [path for path in self._selected_outputs() if path.is_file()]
+        if not files:
+            self.write_log("选中的任务没有可删除的成片。")
+            return
+        answer = QMessageBox.question(
+            self, "删除成片文件",
+            f"从硬盘删除这 {len(files)} 个成片？队列记录会保留。",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        removed = 0
+        for path in files:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                self.write_log(f"无法删除 {path.name}：{exc}")
+        self.write_log(f"已删除 {removed} 个成片文件")
+
     def show_parameters(self) -> None:
         ids = self._selected_ids()
         if len(ids) != 1:
@@ -2824,7 +3178,7 @@ class MainWindow(QMainWindow):
             return
         for pane in (self.single_pane, self.cmp_left, self.cmp_right):
             pane.release()
-        for worker in (self.preview_thread, self.clip_thread, self.probe_thread):
+        for worker in (self.preview_thread, self.clip_thread, self.probe_thread, self.proxy_thread):
             if worker and worker.isRunning():
                 worker.wait(3000)
         event.accept()
