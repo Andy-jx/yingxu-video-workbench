@@ -392,8 +392,73 @@ def prepare_encode(job, src: dict, ffmpeg: str, temp: Path) -> tuple[list[str], 
     return command, plan.parameters, plan.expected_duration, plan.force_verify
 
 
+def default_logo_path() -> Path:
+    return Path(__file__).resolve().parent / "assets" / "default_logo.png"
+
+
+def apply_default_logo(options: ProcessOptions) -> ProcessOptions:
+    """Image watermarks with no file use the built-in logo, including export."""
+    mark = options.watermark
+    if not mark.enabled or mark.style != "image":
+        return options
+    if mark.image and Path(mark.image).is_file():
+        return options
+    return replace(options, watermark=replace(mark, image=str(default_logo_path())))
+
+
+def visual_effects(options: ProcessOptions) -> bool:
+    """True when the current frame can look different from the source."""
+    if options.mirror_h or options.mirror_v or options.crop_enabled or options.fps:
+        return True
+    for name in ("scale", "rotate", "brightness", "contrast", "saturation", "color_temp", "sharpen", "blur"):
+        if getattr(options, name).enabled:
+            return True
+    if options.watermark.enabled:
+        return True
+    if options.masks:
+        return True
+    if options.pip.enabled and options.pip.path:
+        return True
+    if options.photos.enabled and options.photos.paths:
+        return True
+    return False
+
+
+def prepare_preview_options(options: ProcessOptions, draft_mask: MaskSpec | None = None,
+                            include_draft: bool = False) -> ProcessOptions:
+    """Drop incomplete pieces so one empty field does not freeze the whole preview."""
+    options = apply_default_logo(options)
+    mark = options.watermark
+    if mark.enabled:
+        kind = _mark_kind(mark)
+        if kind == "text" and not mark.text.strip():
+            mark = replace(mark, enabled=False)
+        elif mark.style == "path" and len(mark.path_points) < 2:
+            mark = replace(mark, enabled=False)
+        elif kind == "image" and not (mark.image and Path(mark.image).is_file()):
+            mark = replace(mark, enabled=False)
+    pip = options.pip
+    if pip.enabled and not (pip.path and Path(pip.path).is_file()):
+        pip = replace(pip, enabled=False)
+    photos = options.photos
+    if photos.enabled:
+        paths = tuple(path for path in photos.paths if Path(path).is_file())
+        photos = replace(photos, enabled=bool(paths), paths=paths)
+    masks = list(options.masks)
+    if include_draft and draft_mask is not None and not any(_mask_same(item, draft_mask) for item in masks):
+        masks.append(draft_mask)
+    return replace(options, watermark=mark, pip=pip, photos=photos, masks=tuple(masks))
+
+
+def _mask_same(left: MaskSpec, right: MaskSpec) -> bool:
+    return (left.mode == right.mode and abs(left.x - right.x) < 0.005 and abs(left.y - right.y) < 0.005
+            and abs(left.w - right.w) < 0.005 and abs(left.h - right.h) < 0.005
+            and abs(left.start - right.start) < 0.05 and abs(left.end - right.end) < 0.05)
+
+
 def render_still(ffmpeg: str, source: Path, media: dict, options: ProcessOptions,
-                 time_sec: float, output: Path, seed: int) -> None:
+                 time_sec: float, output: Path, seed: int, max_edge: int = 960) -> None:
+    media, options = _fit_preview(media, options, max_edge)
     sampled = sample_options(options, seed)
     source_time = max(0.0, time_sec)
     # 时间轴按原片拖动。停在某个插入点之后的停留时间内时，静帧显示那张照片。
@@ -403,7 +468,7 @@ def render_still(ffmpeg: str, source: Path, media: dict, options: ProcessOptions
         for index, point in enumerate(times):
             if point <= source_time < point + variation["photo_hold"]:
                 photo = options.photos.paths[index % len(options.photos.paths)]
-                width, height = _output_size(int(media["width"]), int(media["height"]), options, sampled)
+                width, height = int(media["width"]), int(media["height"])
                 render_photo_frame(ffmpeg, photo, width, height, variation["photo_hold"], source_time - point,
                                    options.photos.fade_ms / 1000, output)
                 return
@@ -411,6 +476,36 @@ def render_still(ffmpeg: str, source: Path, media: dict, options: ProcessOptions
                       include_audio=False, seed=seed)
     command = command_from_plan(ffmpeg, str(source), str(output), plan, media, options, still_time=source_time)
     _run(command, "预览帧失败")
+
+
+def _fit_preview(media: dict, options: ProcessOptions, max_edge: int) -> tuple[dict, ProcessOptions]:
+    width, height = int(media["width"]), int(media["height"])
+    longest = max(width, height)
+    if max_edge <= 0 or longest <= max_edge or longest < 2:
+        return media, options
+    scale = max_edge / longest
+    fitted = dict(media)
+    fitted["width"] = _even(max(64, round(width * scale)))
+    fitted["height"] = _even(max(64, round(height * scale)))
+    sx = fitted["width"] / width
+    sy = fitted["height"] / height
+    shrink = min(sx, sy)
+    if options.crop_enabled:
+        crop_x = min(fitted["width"] - 16, _even_floor(int(options.crop_x * sx)))
+        crop_y = min(fitted["height"] - 16, _even_floor(int(options.crop_y * sy)))
+        crop_w = max(16, _even(int(options.crop_w * sx)))
+        crop_h = max(16, _even(int(options.crop_h * sy)))
+        crop_w = min(crop_w, fitted["width"] - crop_x)
+        crop_h = min(crop_h, fitted["height"] - crop_y)
+        options = replace(options, crop_x=crop_x, crop_y=crop_y, crop_w=_even(crop_w), crop_h=_even(crop_h))
+    mark = options.watermark
+    options = replace(options, watermark=replace(
+        mark,
+        size=max(8, int(round(mark.size * shrink))),
+        spacing=max(40, int(round(mark.spacing * shrink))),
+        speed=mark.speed * shrink,
+    ))
+    return fitted, options
 
 
 def render_clip(ffmpeg: str, source: Path, media: dict, options: ProcessOptions,

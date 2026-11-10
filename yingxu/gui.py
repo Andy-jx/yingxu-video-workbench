@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -23,10 +24,10 @@ from .models import (
     RangeSpec, WatermarkSpec, make_jobs, preset_dir,
 )
 from .processing import (
-    enabled_summary, find_cjk_font, list_video_encoders, load_profile,
-    options_from_preset, render_clip, render_still, risky_warnings,
-    validate_against_media, validate_options, widget_rect_to_relative, extract_frame,
-    adjacent_source,
+    adjacent_source, apply_default_logo, default_logo_path, enabled_summary, extract_frame,
+    find_cjk_font, list_video_encoders, load_profile, options_from_preset, prepare_preview_options,
+    render_clip, render_still, risky_warnings, validate_against_media, validate_options,
+    visual_effects, widget_rect_to_relative,
 )
 from .queue import BatchRunner, QueueEvent
 from .store import WorkbenchStore
@@ -427,6 +428,8 @@ class MainWindow(QMainWindow):
         self.results: dict[str, dict] = {}
         self.masks: list[MaskSpec] = []
         self.photo_paths: list[str] = []
+        self._mask_preview = False
+        self._last_live = 0.0
         self.thread: QueueThread | None = None
         self.preview_thread: PreviewThread | None = None
         self.clip_thread: ClipThread | None = None
@@ -894,9 +897,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(10, 10, 10, 10)
         self.wm_enabled = QCheckBox("启用水印")
-        self.wm_enabled.toggled.connect(self._on_form_changed)
+        self.wm_enabled.toggled.connect(self._watermark_toggled)
         layout.addWidget(self.wm_enabled)
-        note = QLabel("默认靠近左上、半透明，避免挡住画面中心。平铺建议透明度 0.15 左右。这是真实烧录，不是预览贴图。")
+        note = QLabel("勾选或改参数后，中间预览会马上按当前时间重画。平铺建议透明度 0.15 左右。图片 LOGO 不选文件时使用内置标志，也可以自己换。")
         note.setWordWrap(True)
         note.setObjectName("hint")
         layout.addWidget(note)
@@ -962,7 +965,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(10, 10, 10, 10)
-        warning = QLabel("蒙版是把一块画面盖到字幕上，不是无痕去字幕。人物、商品或复杂运动背景上可能不自然。没添加进列表的区域不会导出。")
+        warning = QLabel("暂停后在画面上拖动框选字幕，并设置时间段。框选后预览立刻显示模糊、复制或翻转。单条视频点「设为单独参数」。未点「添加蒙版」不会写入导出。复杂背景上这不是无痕修复。")
         warning.setObjectName("warning")
         warning.setWordWrap(True)
         layout.addWidget(warning)
@@ -973,6 +976,7 @@ class MainWindow(QMainWindow):
         self.mask_mode = QComboBox()
         for label, value in MASK_LABELS:
             self.mask_mode.addItem(label, value)
+        self.mask_mode.currentIndexChanged.connect(self._on_mask_edited)
         layout.addWidget(self.mask_mode)
         grid = QGridLayout()
         self.mask_x = self._percent_spin(0)
@@ -989,6 +993,7 @@ class MainWindow(QMainWindow):
         )):
             grid.addWidget(QLabel(label), index // 2, (index % 2) * 2)
             grid.addWidget(widget, index // 2, (index % 2) * 2 + 1)
+            widget.valueChanged.connect(self._on_mask_edited)
         layout.addLayout(grid)
         extra = QHBoxLayout()
         extra.addWidget(QLabel("羽化"))
@@ -1000,10 +1005,14 @@ class MainWindow(QMainWindow):
         extra.addWidget(QLabel("模糊"))
         self.mask_blur = self._double_spin(0.2, 40, 0.5, 1, 12)
         extra.addWidget(self.mask_blur)
+        for widget in (self.mask_feather, self.mask_opacity, self.mask_blur):
+            widget.valueChanged.connect(self._on_mask_edited)
         layout.addLayout(extra)
         times = QHBoxLayout()
         self.mask_start = self._double_spin(0, 86400, 0.1, 2, 0)
         self.mask_end = self._double_spin(0, 86400, 0.1, 2, 0)
+        self.mask_start.valueChanged.connect(self._on_mask_edited)
+        self.mask_end.valueChanged.connect(self._on_mask_edited)
         times.addWidget(QLabel("开始"))
         times.addWidget(self.mask_start)
         times.addWidget(self._button("用当前", lambda: self.mask_start.setValue(self.playhead)))
@@ -1307,7 +1316,32 @@ class MainWindow(QMainWindow):
             return
         self._mark_custom()
         self._refresh_summary()
+        if self._effects_on():
+            self.preview_mode = "processed"
+            self.processed_button.setChecked(True)
+            if self.view_mode == "compare":
+                self._show_still()
+                return
+            if self.view_mode == "play":
+                self.preview_stack.setCurrentWidget(self.canvas)
+                self._request_preview()
+                return
         self._schedule_preview()
+
+    def _effects_on(self) -> bool:
+        try:
+            return visual_effects(self._preview_options())
+        except Exception:
+            return False
+
+    def _preview_options(self) -> ProcessOptions:
+        options = apply_default_logo(self.collect_options(validate=False))
+        draft = None
+        try:
+            draft = self._mask_from_form()
+        except Exception:
+            draft = None
+        return prepare_preview_options(options, draft, self._mask_preview)
 
     def _mark_custom(self) -> None:
         if self.preset_choice.currentData() == "custom":
@@ -1327,6 +1361,29 @@ class MainWindow(QMainWindow):
                 self.wm_angle.setValue(-24)
             if style == "translucent" and self.wm_opacity.value() > 0.45:
                 self.wm_opacity.setValue(0.25)
+            self._ensure_watermark_defaults()
+        self._on_form_changed()
+
+    def _watermark_toggled(self, checked: bool) -> None:
+        if checked and not self._loading:
+            self._ensure_watermark_defaults()
+        self._on_form_changed()
+
+    def _ensure_watermark_defaults(self) -> None:
+        if not self.wm_enabled.isChecked():
+            return
+        style = self.wm_style.currentData()
+        self._loading = True
+        if style == "image" and not self.wm_image.text().strip():
+            self.wm_image.setText(str(default_logo_path()))
+        elif style not in {"image", "path"} and not self.wm_text.text().strip():
+            self.wm_text.setText("影序")
+        self._loading = False
+
+    def _on_mask_edited(self, *_args) -> None:
+        if self._loading:
+            return
+        self._mask_preview = True
         self._on_form_changed()
 
     def _roll_seed(self) -> None:
@@ -1366,7 +1423,9 @@ class MainWindow(QMainWindow):
             bgm_volume=self.bgm_volume.value(),
             watermark=WatermarkSpec(
                 enabled=self.wm_enabled.isChecked(), style=str(self.wm_style.currentData() or "text"),
-                text=self.wm_text.text(), image=self.wm_image.text().strip(),
+                text=self.wm_text.text(),
+                image=self.wm_image.text().strip() or (
+                    str(default_logo_path()) if self.wm_style.currentData() == "image" else ""),
                 x=self.wm_x.value() / 100, y=self.wm_y.value() / 100, size=self.wm_size.value(),
                 opacity=self.wm_opacity.value(), angle=self.wm_angle.value(), speed=self.wm_speed.value(),
                 start=self.wm_start.value(), end=self.wm_end.value(), spacing=self.wm_spacing.value(),
@@ -1734,7 +1793,7 @@ class MainWindow(QMainWindow):
         return self.sources[0] if self.sources else None
 
     def _schedule_preview(self) -> None:
-        self.preview_timer.start(220)
+        self.preview_timer.start(90)
 
     def _request_preview(self) -> None:
         self._preview_wanted = True
@@ -1746,16 +1805,18 @@ class MainWindow(QMainWindow):
         if source is None or not info:
             return
         options = None
-        if self.preview_mode == "processed":
+        mode = self.preview_mode
+        if mode != "original":
             try:
-                options = self._options_for(source)
-            except ValueError as exc:
+                options = self._preview_options()
+                mode = "processed" if visual_effects(options) else "original"
+            except Exception as exc:
                 self.preview_info.setText(str(exc))
                 return
         self._token += 1
         output = self.preview_dir / f"frame-{self._token}.png"
         self.preview_thread = PreviewThread(
-            self._token, self.preview_mode, source, info, options or ProcessOptions(),
+            self._token, mode, source, info, options or ProcessOptions(),
             self.playhead, output, self._ffmpeg_path(), self._preview_seed(source),
         )
         self.preview_thread.ok.connect(self._on_preview_ok)
@@ -1846,6 +1907,9 @@ class MainWindow(QMainWindow):
             return
         if self.view_mode == "play":
             self.single_pane.set_position(max(0, value - self._single_base))
+            if self.preview_mode == "processed":
+                self.preview_stack.setCurrentWidget(self.canvas)
+                self._request_preview()
             return
         self._schedule_preview()
 
@@ -1880,17 +1944,26 @@ class MainWindow(QMainWindow):
             self._set_playing(True)
             return
         duration = self._duration()
-        if self.preview_mode == "processed":
-            clip = self.effect_clip
-            if clip and clip["source"] == str(source) and clip["start"] <= self.playhead < clip["start"] + clip["length"] - 0.05:
-                self._play_single(clip["path"], clip["start"], self.playhead, "处理后效果片段（3 秒）")
-            else:
-                self._clip_then = "single"
-                self.preview_clip()
+        if self.preview_mode == "processed" and self._effects_on():
+            self._play_live_effects(source)
             return
         if duration and self.playhead >= duration - 0.05:
             self.playhead = 0.0
         self._play_single(str(source), 0.0, self.playhead, "原片播放")
+
+    def _play_live_effects(self, source: Path) -> None:
+        """Play source audio while the canvas keeps redrawing the processed frame."""
+        self.cmp_left.pause()
+        self.cmp_right.pause()
+        self.compare = None
+        self._single_base = 0
+        self.preview_stack.setCurrentWidget(self.canvas)
+        self.view_mode = "play"
+        self.single_pane.load(str(source), int(self.playhead * 1000))
+        self.single_pane.play()
+        self._set_playing(True)
+        self._last_live = 0.0
+        self._request_preview()
 
     def _play_single(self, path: str, base: float, at: float, title: str) -> None:
         self.cmp_left.pause()
@@ -1945,6 +2018,10 @@ class MainWindow(QMainWindow):
             position = self._single_base + self.single_pane.position()
             if self._playing and self.single_pane.at_end():
                 self._set_playing(False)
+            if self.preview_mode == "processed" and time.monotonic() - self._last_live > 0.16:
+                self._last_live = time.monotonic()
+                self.preview_stack.setCurrentWidget(self.canvas)
+                self._request_preview()
         else:
             return
         self.playhead = position / 1000
@@ -2074,6 +2151,7 @@ class MainWindow(QMainWindow):
         source = self._preview_source()
         info = self.media.get(str(source), {}) if source else {}
         if page == 3:
+            self._mask_preview = True
             self.mask_x.setValue(x * 100)
             self.mask_y.setValue(y * 100)
             self.mask_w.setValue(w * 100)
@@ -2083,7 +2161,8 @@ class MainWindow(QMainWindow):
             self.mask_sy.setValue(sy * 100)
             self.mask_sw.setValue(sw * 100)
             self.mask_sh.setValue(sh * 100)
-            self.preview_info.setText("框选已填入蒙版，复制来源已设为紧邻的同尺寸区域（可手动改）。确认时间后点「添加蒙版」，未添加的不会导出。")
+            self.preview_info.setText("已框选，预览会显示这块蒙版。设好时间段；单条视频点「设为单独参数」。未点「添加蒙版」不会写入导出。")
+            self._schedule_preview()
         elif page == 0 and self.crop_enabled.isChecked() and info:
             self.crop_x.setValue(int(x * info["width"]))
             self.crop_y.setValue(int(y * info["height"]))

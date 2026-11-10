@@ -33,6 +33,13 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(window.stack.count(), 6)
             self.assertFalse(window.pip_enabled.isChecked())
             self.assertFalse(window.photo_enabled.isChecked())
+            window.wm_enabled.setChecked(True)
+            self.assertEqual(window.preview_mode, "processed")
+            self.assertTrue(window.processed_button.isChecked())
+            self.assertEqual(window.wm_text.text(), "影序")
+            window.wm_style.setCurrentIndex(window.wm_style.findData("image"))
+            self.assertTrue(window.wm_image.text().endswith("default_logo.png"))
+            window.wm_enabled.setChecked(False)
             self.assertGreaterEqual(window.minimumWidth(), 960)
             self.assertGreaterEqual(window.minimumHeight(), 640)
 
