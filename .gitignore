@@ -6,6 +6,7 @@ venv/
 dist/
 build/
 *.spec
+!packaging/yingxu.spec
 outputs/
 *.mp4
 *.mkv
