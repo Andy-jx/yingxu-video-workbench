@@ -186,6 +186,92 @@ class MaskSpec:
         return cls(**fields)
 
 
+PIP_POSITIONS = ("tl", "tr", "bl", "br", "center")
+
+
+@dataclass(frozen=True)
+class PipSpec:
+    """A real video laid over the main picture. Disabled or empty means it is not applied."""
+
+    enabled: bool = False
+    path: str = ""
+    position: str = "tr"
+    size: float = 0.22
+    opacity: float = 0.08
+    opacity_jitter: float = 0.03
+    position_jitter: float = 0.02
+    size_jitter: float = 0.0
+    audio_percent: float = 0.0
+    short_mode: str = "loop"
+    start: float = 0.0
+    end: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled, "path": self.path, "position": self.position, "size": self.size,
+            "opacity": self.opacity, "opacity_jitter": self.opacity_jitter,
+            "position_jitter": self.position_jitter, "size_jitter": self.size_jitter,
+            "audio_percent": self.audio_percent, "short_mode": self.short_mode,
+            "start": self.start, "end": self.end,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> PipSpec:
+        if not isinstance(data, dict):
+            return cls()
+        base = cls()
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            path=str(data.get("path", "")),
+            position=str(data.get("position", base.position)),
+            size=float(data.get("size", base.size)),
+            opacity=float(data.get("opacity", base.opacity)),
+            opacity_jitter=float(data.get("opacity_jitter", base.opacity_jitter)),
+            position_jitter=float(data.get("position_jitter", base.position_jitter)),
+            size_jitter=float(data.get("size_jitter", base.size_jitter)),
+            audio_percent=float(data.get("audio_percent", base.audio_percent)),
+            short_mode=str(data.get("short_mode", base.short_mode)),
+            start=float(data.get("start", 0.0)),
+            end=float(data.get("end", 0.0)),
+        )
+
+
+@dataclass(frozen=True)
+class PhotoInsertSpec:
+    """Real photos inserted into the timeline. Disabled or empty means they are not applied."""
+
+    enabled: bool = False
+    paths: tuple[str, ...] = ()
+    interval: float = 3.0
+    interval_jitter: float = 0.4
+    hold_ms: int = 400
+    hold_jitter_ms: int = 80
+    fade_ms: int = 120
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled, "paths": list(self.paths), "interval": self.interval,
+            "interval_jitter": self.interval_jitter, "hold_ms": self.hold_ms,
+            "hold_jitter_ms": self.hold_jitter_ms, "fade_ms": self.fade_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> PhotoInsertSpec:
+        if not isinstance(data, dict):
+            return cls()
+        base = cls()
+        paths = tuple(str(item) for item in (data.get("paths") or []) if str(item).strip())
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            paths=paths,
+            interval=float(data.get("interval", base.interval)),
+            interval_jitter=float(data.get("interval_jitter", base.interval_jitter)),
+            hold_ms=int(data.get("hold_ms", base.hold_ms)),
+            hold_jitter_ms=int(data.get("hold_jitter_ms", base.hold_jitter_ms)),
+            fade_ms=int(data.get("fade_ms", base.fade_ms)),
+        )
+
+
 @dataclass(frozen=True)
 class ProcessOptions:
     """Explicit processing switches. Anything left disabled is not applied."""
@@ -226,6 +312,8 @@ class ProcessOptions:
     bgm_volume: float = 0.40
     watermark: WatermarkSpec = field(default_factory=WatermarkSpec)
     masks: tuple[MaskSpec, ...] = ()
+    pip: PipSpec = field(default_factory=PipSpec)
+    photos: PhotoInsertSpec = field(default_factory=PhotoInsertSpec)
     font: str = ""
 
     def to_dict(self) -> dict:
@@ -243,6 +331,7 @@ class ProcessOptions:
             "loudnorm": self.loudnorm, "mute": self.mute, "bgm_mode": self.bgm_mode,
             "bgm_path": self.bgm_path, "bgm_volume": self.bgm_volume,
             "watermark": self.watermark.to_dict(), "masks": [m.to_dict() for m in self.masks],
+            "pip": self.pip.to_dict(), "photos": self.photos.to_dict(),
             "font": self.font,
         }
 
@@ -282,7 +371,10 @@ class ProcessOptions:
             bgm_mode=str(data.get("bgm_mode", "off")), bgm_path=str(data.get("bgm_path", "")),
             bgm_volume=float(data.get("bgm_volume", base.bgm_volume)),
             watermark=WatermarkSpec.from_dict(data.get("watermark")),
-            masks=masks, font=str(data.get("font", "")),
+            masks=masks,
+            pip=PipSpec.from_dict(data.get("pip")),
+            photos=PhotoInsertSpec.from_dict(data.get("photos")),
+            font=str(data.get("font", "")),
         )
 
 

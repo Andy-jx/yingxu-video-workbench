@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from yingxu.engine import probe_media, run_job
-from yingxu.models import MaskSpec, Preset, ProcessOptions, RangeSpec, WatermarkSpec, make_jobs
+from yingxu.models import MaskSpec, PhotoInsertSpec, PipSpec, Preset, ProcessOptions, RangeSpec, WatermarkSpec, make_jobs
 from yingxu.processing import extract_frame, render_still
 
 
@@ -89,6 +89,75 @@ class FFmpegTests(unittest.TestCase):
             during = root / "during.png"
             extract_frame(ffmpeg, rich_result.output, 1.0, during)
             self.assertNotEqual(before.read_bytes(), during.read_bytes())
+
+    def test_pip_and_photo_insert_are_real(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ffmpeg = shutil.which("ffmpeg")
+            ffprobe = shutil.which("ffprobe")
+            src = root / "主片.mp4"
+            pip = root / "叠加.mp4"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=25:duration=1.6",
+                            "-f", "lavfi", "-i", "sine=frequency=440:duration=1.6",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(src)], check=True)
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "color=c=red:s=80x80:d=0.4",
+                            "-f", "lavfi", "-i", "sine=frequency=880:duration=0.4",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(pip)], check=True)
+            photo_a = root / "照片A.png"
+            photo_b = root / "照片B.png"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "color=c=blue:s=60x40", "-frames:v", "1", str(photo_a)], check=True)
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "color=c=yellow:s=30x80", "-frames:v", "1", str(photo_b)], check=True)
+            original = src.read_bytes()
+            preset = Preset("test")
+            out = root / "导出"
+            plain = run_job(make_jobs([src], out, 1, 1, preset, False, ProcessOptions())[0])
+            overlaid = ProcessOptions(pip=PipSpec(
+                enabled=True, path=str(pip), position="tl", size=0.45, opacity=1, opacity_jitter=0,
+                position_jitter=0, audio_percent=0, short_mode="loop",
+            ))
+            pip_job = make_jobs([src], out, 1, 2, preset, False, overlaid)[0]
+            pip_result = run_job(pip_job)
+            faint = ProcessOptions(pip=PipSpec(
+                enabled=True, path=str(pip), position="tl", size=0.45, opacity=0.05, opacity_jitter=0,
+                position_jitter=0, audio_percent=0, short_mode="loop",
+            ))
+            faint_result = run_job(make_jobs([src], out, 1, 4, preset, False, faint)[0])
+            photos = ProcessOptions(photos=PhotoInsertSpec(
+                enabled=True, paths=(str(photo_a), str(photo_b)), interval=0.5, interval_jitter=0,
+                hold_ms=300, hold_jitter_ms=0, fade_ms=40,
+            ))
+            photo_job = make_jobs([src], out, 1, 3, preset, True, photos)[0]
+            photo_result = run_job(photo_job)
+            self.assertEqual(src.read_bytes(), original)
+            plain_info = probe_media(plain.output, ffprobe)
+            pip_info = probe_media(pip_result.output, ffprobe)
+            photo_info = probe_media(photo_result.output, ffprobe)
+            self.assertAlmostEqual(pip_info["duration"], plain_info["duration"], delta=0.15)
+            self.assertGreater(pip_info["audio_count"], 0)
+            self.assertGreater(photo_info["duration"], plain_info["duration"] + 0.4)
+            self.assertTrue(photo_result.parameters["forced_full_verify"])
+            plain_px = self._pixel(ffmpeg, plain.output)
+            pip_px = self._pixel(ffmpeg, pip_result.output)
+            faint_px = self._pixel(ffmpeg, faint_result.output)
+            self.assertGreater(pip_px[0], plain_px[0] + 40)
+            self.assertGreater(pip_px[0], pip_px[2] + 40)
+            self.assertGreater(pip_px[0], faint_px[0] + 40)
+            self.assertGreater(faint_px[0], plain_px[0])
+
+    def _pixel(self, ffmpeg: str, path: Path) -> bytes:
+        raw = path.with_suffix(".pix.raw")
+        subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+             "-frames:v", "1", "-vf", "crop=8:8:16:16", "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw)],
+            check=True,
+        )
+        data = raw.read_bytes()
+        self.assertGreaterEqual(len(data), 3)
+        return data[:3]
 
 
 if __name__ == "__main__":

@@ -19,8 +19,8 @@ from PySide6.QtWidgets import (
 
 from .engine import probe_media, resolve_executable
 from .models import (
-    ENCODER_PRESETS, JobSpec, MaskSpec, Preset, ProcessOptions, RangeSpec,
-    WatermarkSpec, make_jobs, preset_dir,
+    ENCODER_PRESETS, JobSpec, MaskSpec, PhotoInsertSpec, PipSpec, Preset, ProcessOptions,
+    RangeSpec, WatermarkSpec, make_jobs, preset_dir,
 )
 from .processing import (
     enabled_summary, find_cjk_font, list_video_encoders, load_profile,
@@ -426,6 +426,7 @@ class MainWindow(QMainWindow):
         self.states: dict[str, str] = {}
         self.results: dict[str, dict] = {}
         self.masks: list[MaskSpec] = []
+        self.photo_paths: list[str] = []
         self.thread: QueueThread | None = None
         self.preview_thread: PreviewThread | None = None
         self.clip_thread: ClipThread | None = None
@@ -622,7 +623,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(4)
         layout.addWidget(self._section("功能"))
         self.nav = QListWidget()
-        for name in ("画面", "音频", "水印", "字幕蒙版", "导出"):
+        for name in ("画面", "音频", "水印", "字幕蒙版", "叠加加帧", "导出"):
             self.nav.addItem(name)
         self.nav.setCurrentRow(0)
         row_h = max(30, self.nav.sizeHintForRow(0))
@@ -753,6 +754,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._page_audio())
         self.stack.addWidget(self._page_watermark())
         self.stack.addWidget(self._page_mask())
+        self.stack.addWidget(self._page_dedup())
         self.stack.addWidget(self._page_export())
         scroll.setWidget(self.stack)
         layout.addWidget(scroll)
@@ -1017,6 +1019,105 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return page
 
+    def _page_dedup(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        pip_box = QGroupBox("画中画")
+        pip = QVBoxLayout(pip_box)
+        self.pip_enabled = QCheckBox("启用画中画")
+        self.pip_enabled.toggled.connect(self._on_form_changed)
+        pip.addWidget(self.pip_enabled)
+        note = QLabel("叠一段自己拍的视频。默认静音，不改变镜头顺序。未勾选或未选视频时不会写入命令。")
+        note.setWordWrap(True)
+        note.setObjectName("hint")
+        pip.addWidget(note)
+        path_row = QHBoxLayout()
+        self.pip_path = QLineEdit()
+        self.pip_path.setPlaceholderText("选择叠加视频")
+        self.pip_path.textChanged.connect(self._on_form_changed)
+        path_row.addWidget(self.pip_path, 1)
+        path_row.addWidget(self._button("浏览…", self.choose_pip))
+        pip.addLayout(path_row)
+        self.pip_position = QComboBox()
+        for label, value in (("左上", "tl"), ("右上", "tr"), ("左下", "bl"), ("右下", "br"), ("居中", "center")):
+            self.pip_position.addItem(label, value)
+        self.pip_position.setCurrentIndex(1)
+        self.pip_position.currentIndexChanged.connect(self._on_form_changed)
+        pip.addWidget(self.pip_position)
+        grid = QGridLayout()
+        self.pip_size = self._percent_spin(22)
+        self.pip_opacity = self._percent_spin(8)
+        self.pip_opacity_jitter = self._percent_spin(3)
+        self.pip_position_jitter = self._percent_spin(2)
+        self.pip_size_jitter = self._percent_spin(0)
+        self.pip_audio = self._double_spin(0, 100, 1, 0, 0)
+        self.pip_start = self._double_spin(0, 86400, 0.1, 2, 0)
+        self.pip_end = self._double_spin(0, 86400, 0.1, 2, 0)
+        for widget in (self.pip_size, self.pip_opacity, self.pip_opacity_jitter, self.pip_position_jitter,
+                       self.pip_size_jitter, self.pip_audio, self.pip_start, self.pip_end):
+            widget.valueChanged.connect(self._on_form_changed)
+        fields = [
+            ("宽度%", self.pip_size), ("透明度%", self.pip_opacity),
+            ("透明度浮动", self.pip_opacity_jitter), ("位置浮动", self.pip_position_jitter),
+            ("尺寸浮动", self.pip_size_jitter), ("音量%", self.pip_audio),
+            ("出现", self.pip_start), ("结束", self.pip_end),
+        ]
+        for index, (label, widget) in enumerate(fields):
+            grid.addWidget(QLabel(label), index // 2, (index % 2) * 2)
+            grid.addWidget(widget, index // 2, (index % 2) * 2 + 1)
+        pip.addLayout(grid)
+        self.pip_short = QComboBox()
+        self.pip_short.addItem("比主片短时循环", "loop")
+        self.pip_short.addItem("比主片短时停在尾帧", "hold")
+        self.pip_short.currentIndexChanged.connect(self._on_form_changed)
+        pip.addWidget(self.pip_short)
+        hint = QLabel("音量 0 表示静音，1 表示保留 1% 音量。结束为 0 表示直到主片结束。浮动让各版本略有差别，同一种子可复现。")
+        hint.setWordWrap(True)
+        hint.setObjectName("hint")
+        pip.addWidget(hint)
+        layout.addWidget(pip_box)
+
+        self.photo_box = QGroupBox("真实照片加帧")
+        photos = QVBoxLayout(self.photo_box)
+        self.photo_enabled = QCheckBox("启用照片加帧")
+        self.photo_enabled.toggled.connect(self._on_form_changed)
+        photos.addWidget(self.photo_enabled)
+        warn = QLabel("把照片插进时间轴，成片会变长，镜头之间会多出这些画面。成片二次处理模式不可用。未勾选或没有照片时不会写入命令。")
+        warn.setWordWrap(True)
+        warn.setObjectName("warning")
+        photos.addWidget(warn)
+        self.photo_list = QListWidget()
+        self.photo_list.setMaximumHeight(90)
+        photos.addWidget(self.photo_list)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self._button("添加照片", self.add_photos))
+        buttons.addWidget(self._button("移除选中", self.remove_photo))
+        photos.addLayout(buttons)
+        photo_grid = QGridLayout()
+        self.photo_interval = self._double_spin(0.2, 120, 0.1, 2, 3)
+        self.photo_jitter = self._double_spin(0, 30, 0.1, 2, 0.4)
+        self.photo_hold = self._int_spin(40, 5000, 400)
+        self.photo_hold_jitter = self._int_spin(0, 2000, 80)
+        self.photo_fade = self._int_spin(0, 2000, 120)
+        for widget in (self.photo_interval, self.photo_jitter, self.photo_hold, self.photo_hold_jitter, self.photo_fade):
+            widget.valueChanged.connect(self._on_form_changed)
+        for index, (label, widget) in enumerate((
+            ("间隔秒", self.photo_interval), ("间隔浮动", self.photo_jitter),
+            ("停留毫秒", self.photo_hold), ("停留浮动", self.photo_hold_jitter),
+            ("淡入淡出", self.photo_fade),
+        )):
+            photo_grid.addWidget(QLabel(label), index, 0)
+            photo_grid.addWidget(widget, index, 1)
+        photos.addLayout(photo_grid)
+        fit = QLabel("照片按画面居中适配，上下或左右留黑边，不拉伸。多张照片轮流插入。")
+        fit.setWordWrap(True)
+        fit.setObjectName("hint")
+        photos.addWidget(fit)
+        layout.addWidget(self.photo_box)
+        layout.addStretch()
+        return page
+
     def _page_export(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1185,10 +1286,13 @@ class MainWindow(QMainWindow):
         self.rotate.setEnabled(not film)
         if film:
             self.rotate.uncheck()
+        self.photo_box.setEnabled(not film)
+        if film:
+            self.photo_enabled.setChecked(False)
         hints = {
             "single": "选中一条素材，按版本数导出多个成片。",
             "batch": "全部素材进队列。某一条失败不影响其他条目。",
-            "film": "不重排镜头。镜像、旋转、裁剪和抽帧已锁定。",
+            "film": "不重排镜头。镜像、旋转、裁剪、抽帧和照片加帧已锁定。画中画仍可用。",
         }
         self.mode_hint.setText(hints[mode])
         self._refresh_summary()
@@ -1269,6 +1373,23 @@ class MainWindow(QMainWindow):
                 path_points=points, font=self.font_edit.text().strip(),
             ),
             masks=tuple(self.masks), font=self.font_edit.text().strip(),
+            pip=PipSpec(
+                enabled=self.pip_enabled.isChecked(), path=self.pip_path.text().strip(),
+                position=str(self.pip_position.currentData() or "tr"),
+                size=self.pip_size.value() / 100, opacity=self.pip_opacity.value() / 100,
+                opacity_jitter=self.pip_opacity_jitter.value() / 100,
+                position_jitter=self.pip_position_jitter.value() / 100,
+                size_jitter=self.pip_size_jitter.value() / 100,
+                audio_percent=self.pip_audio.value(),
+                short_mode=str(self.pip_short.currentData() or "loop"),
+                start=self.pip_start.value(), end=self.pip_end.value(),
+            ),
+            photos=PhotoInsertSpec(
+                enabled=self.photo_enabled.isChecked(), paths=tuple(self.photo_paths),
+                interval=self.photo_interval.value(), interval_jitter=self.photo_jitter.value(),
+                hold_ms=self.photo_hold.value(), hold_jitter_ms=self.photo_hold_jitter.value(),
+                fade_ms=self.photo_fade.value(),
+            ),
         )
         if self.mode == "film":
             options = self._strip_film(options)
@@ -1331,6 +1452,27 @@ class MainWindow(QMainWindow):
             self.font_edit.setText(options.font or mark.font)
             self.masks = list(options.masks)
             self._refresh_mask_list()
+            pip = options.pip
+            self.pip_enabled.setChecked(pip.enabled)
+            self.pip_path.setText(pip.path)
+            self._set_combo(self.pip_position, pip.position)
+            self.pip_size.setValue(pip.size * 100)
+            self.pip_opacity.setValue(pip.opacity * 100)
+            self.pip_opacity_jitter.setValue(pip.opacity_jitter * 100)
+            self.pip_position_jitter.setValue(pip.position_jitter * 100)
+            self.pip_size_jitter.setValue(pip.size_jitter * 100)
+            self.pip_audio.setValue(pip.audio_percent)
+            self._set_combo(self.pip_short, pip.short_mode)
+            self.pip_start.setValue(pip.start)
+            self.pip_end.setValue(pip.end)
+            self.photo_enabled.setChecked(options.photos.enabled)
+            self.photo_paths = list(options.photos.paths)
+            self._refresh_photo_list()
+            self.photo_interval.setValue(options.photos.interval)
+            self.photo_jitter.setValue(options.photos.interval_jitter)
+            self.photo_hold.setValue(options.photos.hold_ms)
+            self.photo_hold_jitter.setValue(options.photos.hold_jitter_ms)
+            self.photo_fade.setValue(options.photos.fade_ms)
         finally:
             self._loading = False
         self._refresh_summary()
@@ -1339,6 +1481,9 @@ class MainWindow(QMainWindow):
         data = options.to_dict()
         data.update({"mirror_h": False, "mirror_v": False, "crop_enabled": False, "drop_enabled": False,
                      "rotate": {"enabled": False, "low": 0, "high": 0}})
+        photos = dict(data.get("photos") or {})
+        photos["enabled"] = False
+        data["photos"] = photos
         return ProcessOptions.from_dict(data)
 
     def _parse_points(self, text: str) -> tuple[tuple[float, float], ...]:
@@ -1502,6 +1647,50 @@ class MainWindow(QMainWindow):
             self.wm_image.setText(chosen)
             if not self.wm_enabled.isChecked():
                 self.wm_enabled.setChecked(True)
+
+    def choose_pip(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "选择画中画视频", str(Path.home()),
+            "视频 (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.ts);;所有文件 (*.*)")
+        if chosen:
+            self.pip_path.setText(chosen)
+            if not self.pip_enabled.isChecked():
+                self.pip_enabled.setChecked(True)
+
+    def add_photos(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileNames(
+            self, "选择照片", str(Path.home()),
+            "照片 (*.jpg *.jpeg *.png *.webp *.bmp);;所有文件 (*.*)")
+        added = 0
+        for raw in chosen:
+            path = str(Path(raw).resolve())
+            if Path(path).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+                self.write_log(f"跳过不支持的照片：{Path(path).name}")
+                continue
+            if path not in self.photo_paths:
+                self.photo_paths.append(path)
+                added += 1
+        if added:
+            if not self.photo_enabled.isChecked() and self.photo_box.isEnabled():
+                self.photo_enabled.setChecked(True)
+            self._refresh_photo_list()
+            self._on_form_changed()
+            self.write_log(f"已添加 {added} 张照片，当前 {len(self.photo_paths)} 张")
+
+    def remove_photo(self) -> None:
+        row = self.photo_list.currentRow()
+        if row < 0 or row >= len(self.photo_paths):
+            return
+        del self.photo_paths[row]
+        self._refresh_photo_list()
+        self._on_form_changed()
+
+    def _refresh_photo_list(self) -> None:
+        self.photo_list.clear()
+        for path in self.photo_paths:
+            item = QListWidgetItem(Path(path).name)
+            item.setToolTip(path)
+            self.photo_list.addItem(item)
 
     def choose_font(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(self, "选择字体", str(Path.home()), "字体 (*.ttf *.otf *.ttc);;所有文件 (*.*)")
@@ -2431,6 +2620,9 @@ class MainWindow(QMainWindow):
             return
         for pane in (self.single_pane, self.cmp_left, self.cmp_right):
             pane.release()
+        for worker in (self.preview_thread, self.clip_thread, self.probe_thread):
+            if worker and worker.isRunning():
+                worker.wait(3000)
         event.accept()
 
 

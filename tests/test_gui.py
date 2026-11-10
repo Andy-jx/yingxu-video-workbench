@@ -30,7 +30,9 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertFalse(window.advanced.isVisible())
             self.assertFalse(window.mirror_h.isChecked())
             self.assertFalse(window.drop_enabled.isChecked())
-            self.assertEqual(window.stack.count(), 5)
+            self.assertEqual(window.stack.count(), 6)
+            self.assertFalse(window.pip_enabled.isChecked())
+            self.assertFalse(window.photo_enabled.isChecked())
             self.assertGreaterEqual(window.minimumWidth(), 960)
             self.assertGreaterEqual(window.minimumHeight(), 640)
 
@@ -46,6 +48,8 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertFalse(window.mirror_h.isEnabled())
             self.assertFalse(window.rotate.isEnabled())
             self.assertFalse(window.drop_enabled.isChecked())
+            self.assertFalse(window.photo_box.isEnabled())
+            self.assertTrue(window.pip_enabled.isEnabled())
 
             root = Path(tempfile.mkdtemp())
             source = root / "素材.mp4"

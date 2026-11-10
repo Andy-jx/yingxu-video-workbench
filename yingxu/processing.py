@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 import shutil
 import subprocess
@@ -11,8 +12,8 @@ from pathlib import Path
 
 from .engine import MediaError, _flags
 from .models import (
-    ENCODER_PRESETS, MASK_MODES, VIDEO_CODECS, WATERMARK_STYLES,
-    MaskSpec, Preset, ProcessOptions, RangeSpec, WatermarkSpec,
+    ENCODER_PRESETS, MASK_MODES, PIP_POSITIONS, VIDEO_CODECS, WATERMARK_STYLES,
+    MaskSpec, PhotoInsertSpec, PipSpec, Preset, ProcessOptions, RangeSpec, WatermarkSpec,
 )
 
 RANGE_ORDER = (
@@ -32,6 +33,7 @@ class FilterPlan:
     parameters: dict = field(default_factory=dict)
     expected_duration: float = 0.0
     force_verify: bool = False
+    seek_output: bool = False
 
 
 def options_from_preset(preset: Preset) -> ProcessOptions:
@@ -105,6 +107,8 @@ def validate_options(options: ProcessOptions) -> None:
     _validate_watermark(options.watermark)
     for index, mask in enumerate(options.masks, start=1):
         _validate_mask(mask, index)
+    _validate_pip(options.pip)
+    _validate_photos(options.photos)
     if options.font and not Path(options.font).is_file():
         raise ValueError(f"找不到字体文件: {options.font}")
 
@@ -168,6 +172,10 @@ def enabled_summary(options: ProcessOptions) -> list[str]:
         lines.append("水印·" + _style_name(options.watermark.style))
     if options.masks:
         lines.append(f"字幕蒙版 {len(options.masks)} 段")
+    if options.pip.enabled:
+        lines.append("画中画" if options.pip.path else "画中画（未选视频）")
+    if options.photos.enabled:
+        lines.append(f"照片加帧 {len(options.photos.paths)} 张" if options.photos.paths else "照片加帧（未加照片）")
     lines.append(f"编码 {_codec_name(options.codec)} CRF{options.crf}")
     return lines
 
@@ -192,12 +200,16 @@ def risky_warnings(options: ProcessOptions) -> list[str]:
         lines.append("原声会被背景音乐替换。")
     if options.masks:
         lines.append("字幕蒙版是区域覆盖，不是无痕修复。人物、商品或复杂背景上可能不自然。")
+    if options.pip.enabled and options.pip.audio_percent > 0:
+        lines.append(f"画中画会按 {options.pip.audio_percent:.0f}% 混入叠加视频的声音。")
+    if options.photos.enabled:
+        lines.append("照片加帧会拉长视频，并在原镜头之间插入这些照片。")
     return lines
 
 
 def build_plan(options: ProcessOptions, sampled: dict[str, float | None], media: dict, *,
                preview_time: float | None = None, time_origin: float = 0.0,
-               include_timing: bool = True, include_audio: bool = True) -> FilterPlan:
+               include_timing: bool = True, include_audio: bool = True, seed: int = 0) -> FilterPlan:
     validate_options(options)
     width = int(media["width"])
     height = int(media["height"])
@@ -208,7 +220,16 @@ def build_plan(options: ProcessOptions, sampled: dict[str, float | None], media:
     tempo = speed * drop_ratio
     if abs(tempo) < 1e-6:
         raise ValueError("变速倍率无效")
-    expected = duration / tempo
+    main_duration = duration / tempo
+    variation = dedup_sample(options, seed)
+    photo_times = []
+    if options.photos.enabled and options.photos.paths and preview_time is None:
+        photo_times = photo_insert_times(main_duration, variation["photo_interval"], variation["photo_phase"])
+        if not photo_times:
+            raise ValueError("视频太短，按当前间隔插不进照片。请缩短间隔或换更长的视频。")
+        if len(photo_times) > 240:
+            raise ValueError("插入次数超过 240 次，请加大间隔。")
+    expected = main_duration + len(photo_times) * variation["photo_hold"]
     out_w, out_h = _output_size(width, height, options, sampled)
     font = _resolve_font(options)
     video_filters = _linear_video_filters(options, sampled, width, height, include_timing=include_timing and preview_time is None)
@@ -216,17 +237,23 @@ def build_plan(options: ProcessOptions, sampled: dict[str, float | None], media:
     time_scale = tempo if (include_timing and preview_time is None) else 1.0
     mask_filters, out_w, out_h = _active_masks(options, preview_time, out_w, out_h, time_origin, time_scale)
     wm_filters, wm_inputs, wm_label = _watermark_filters(
-        options.watermark, out_w, out_h, expected, font, preview_time, time_origin, time_scale,
+        options.watermark, out_w, out_h, main_duration, font, preview_time, time_origin, time_scale,
     )
+    pip_active = _pip_active(options.pip, preview_time)
     audio_count = int(media.get("audio_count") or 0)
     audio_filters = []
     use_bgm = False
     if include_audio:
         audio_filters = _linear_audio_filters(options, sampled, tempo if include_timing else 1.0, audio_count)
         use_bgm = options.bgm_mode != "off"
-    needs_graph = bool(video_filters or mask_filters or wm_filters or audio_filters or use_bgm)
-    plan = FilterPlan(expected_duration=expected, force_verify=_needs_forced_verify(options, sampled))
+    needs_graph = bool(video_filters or mask_filters or wm_filters or audio_filters or use_bgm or pip_active or photo_times)
+    plan = FilterPlan(expected_duration=expected, force_verify=_needs_forced_verify(options, sampled) or bool(photo_times),
+                      seek_output=bool(photo_times))
     plan.parameters = _parameters(options, sampled, tempo, expected, font)
+    if options.pip.enabled or options.photos.enabled:
+        plan.parameters["dedup"] = variation
+        if photo_times:
+            plan.parameters["photo_inserts"] = photo_times
     if not needs_graph:
         plan.map_source_audio = audio_count > 0 and include_audio
         plan.has_audio = plan.map_source_audio
@@ -253,15 +280,30 @@ def build_plan(options: ProcessOptions, sampled: dict[str, float | None], media:
         segments.extend(part.replace("__SRC__", current) for part in wm_filters)
         if wm_label:
             current = wm_label
+    plan.extra_inputs.extend(wm_inputs)
+    if pip_active:
+        pip_body, pip_input, pip_audio = _pip_overlay(
+            options.pip, variation, current, out_w, out_h, main_duration, preview_time,
+            len(plan.extra_inputs) + 1, time_scale,
+        )
+        segments.append(pip_body)
+        current = pip_body.rsplit("[", 1)[-1].rstrip("]")
+        plan.extra_inputs.append(pip_input)
+        plan.parameters["pip"] = {
+            "opacity": variation["pip_opacity"], "size": variation["pip_size"],
+            "position": options.pip.position, "audio_percent": options.pip.audio_percent,
+            "short_mode": options.pip.short_mode,
+        }
+    else:
+        pip_audio = None
     chain("format=yuv420p")
     plan.vout = current
-    plan.extra_inputs.extend(wm_inputs)
 
     bgm_mode = "replace" if options.mute and options.bgm_mode == "mix" else options.bgm_mode
     if bgm_mode != "off":
+        bgm_index = 1 + len(plan.extra_inputs)
         plan.extra_inputs.append(("bgm", options.bgm_path))
-        bgm_index = 1 + sum(1 for kind, _ in plan.extra_inputs if kind == "image")
-        bgm = (f"[{bgm_index}:a]atrim=0:{max(0.1, expected):.3f},asetpts=PTS-STARTPTS,"
+        bgm = (f"[{bgm_index}:a]atrim=0:{max(0.1, main_duration):.3f},asetpts=PTS-STARTPTS,"
                f"volume={options.bgm_volume:.4f}")
         if bgm_mode == "mix" and audio_count:
             base = ",".join(audio_filters) if audio_filters else "anull"
@@ -282,6 +324,11 @@ def build_plan(options: ProcessOptions, sampled: dict[str, float | None], media:
         plan.has_audio = True
     if audio_count > 1 and (audio_filters or bgm_mode != "off"):
         plan.parameters["audio_note"] = "只处理第一条音轨"
+    if pip_audio and include_audio:
+        _mix_pip_audio(segments, plan, pip_audio, audio_count, main_duration)
+    if photo_times:
+        _insert_photos(segments, plan, options.photos, photo_times, variation, out_w, out_h,
+                       main_duration, float(media.get("fps") or 25), bool(audio_count and include_audio))
     plan.graph = ";".join(segments)
     return plan
 
@@ -292,14 +339,20 @@ def command_from_plan(ffmpeg: str, source: str, output: str, plan: FilterPlan,
                       clip: tuple[float, float] | None = None) -> list[str]:
     preview = still_time is not None or clip is not None
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y" if preview else "-n"]
-    if clip is not None:
+    if clip is not None and not plan.seek_output:
         cmd += ["-ss", f"{clip[0]:.3f}", "-t", f"{clip[1]:.3f}"]
     elif still_time is not None:
         cmd += ["-ss", f"{still_time:.3f}"]
     cmd += ["-i", source]
-    for kind, path in plan.extra_inputs:
-        if kind == "image":
+    for item in plan.extra_inputs:
+        kind, path = item[0], item[1]
+        seek = item[2] if len(item) > 2 and item[2] is not None else None
+        if seek is not None:
+            cmd += ["-ss", f"{float(seek):.3f}"]
+        if kind in {"image", "photo"}:
             cmd += ["-framerate", "25", "-loop", "1", "-i", path]
+        elif kind == "pip_hold" or (kind == "pip_loop" and seek is not None):
+            cmd += ["-i", path]
         else:
             cmd += ["-stream_loop", "-1", "-i", path]
     if plan.graph:
@@ -323,6 +376,8 @@ def command_from_plan(ffmpeg: str, source: str, output: str, plan: FilterPlan,
         cmd += ["-c:a", "aac", "-b:a", "128k" if clip else "192k"]
     if clip is None:
         cmd += ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats"]
+    elif plan.seek_output:
+        cmd += ["-ss", f"{clip[0]:.3f}", "-t", f"{clip[1]:.3f}"]
     cmd += ["-f", "mp4", output]
     return cmd
 
@@ -332,7 +387,7 @@ def prepare_encode(job, src: dict, ffmpeg: str, temp: Path) -> tuple[list[str], 
     if not isinstance(options, ProcessOptions):
         raise TypeError("任务缺少处理方案")
     sampled = sample_options(options, job.derived_seed())
-    plan = build_plan(options, sampled, src)
+    plan = build_plan(options, sampled, src, seed=job.derived_seed())
     command = command_from_plan(ffmpeg, str(job.source), str(temp), plan, src, options)
     return command, plan.parameters, plan.expected_duration, plan.force_verify
 
@@ -340,15 +395,28 @@ def prepare_encode(job, src: dict, ffmpeg: str, temp: Path) -> tuple[list[str], 
 def render_still(ffmpeg: str, source: Path, media: dict, options: ProcessOptions,
                  time_sec: float, output: Path, seed: int) -> None:
     sampled = sample_options(options, seed)
-    plan = build_plan(options, sampled, media, preview_time=time_sec, include_timing=False, include_audio=False)
-    command = command_from_plan(ffmpeg, str(source), str(output), plan, media, options, still_time=time_sec)
+    source_time = max(0.0, time_sec)
+    # 时间轴按原片拖动。停在某个插入点之后的停留时间内时，静帧显示那张照片。
+    if options.photos.enabled and options.photos.paths:
+        variation = dedup_sample(options, seed)
+        times = photo_insert_times(float(media["duration"]), variation["photo_interval"], variation["photo_phase"])
+        for index, point in enumerate(times):
+            if point <= source_time < point + variation["photo_hold"]:
+                photo = options.photos.paths[index % len(options.photos.paths)]
+                width, height = _output_size(int(media["width"]), int(media["height"]), options, sampled)
+                render_photo_frame(ffmpeg, photo, width, height, variation["photo_hold"], source_time - point,
+                                   options.photos.fade_ms / 1000, output)
+                return
+    plan = build_plan(options, sampled, media, preview_time=source_time, include_timing=False,
+                      include_audio=False, seed=seed)
+    command = command_from_plan(ffmpeg, str(source), str(output), plan, media, options, still_time=source_time)
     _run(command, "预览帧失败")
 
 
 def render_clip(ffmpeg: str, source: Path, media: dict, options: ProcessOptions,
                 start: float, length: float, output: Path, seed: int) -> None:
     sampled = sample_options(options, seed)
-    plan = build_plan(options, sampled, media, time_origin=start, include_timing=True)
+    plan = build_plan(options, sampled, media, time_origin=start, include_timing=True, seed=seed)
     command = command_from_plan(
         ffmpeg, str(source), str(output), plan, media, options, clip=(start, length),
     )
@@ -583,9 +651,336 @@ def _parameters(options: ProcessOptions, sampled: dict, tempo: float, expected: 
     return params
 
 
+def dedup_sample(options: ProcessOptions, seed: int) -> dict:
+    """Independent random stream so picture ranges stay stable when dedup jitter is used."""
+    rng = random.Random((int(seed) + 917003) & ((1 << 63) - 1))
+    pip = options.pip
+    photos = options.photos
+    opacity = _clamp(pip.opacity + rng.uniform(-pip.opacity_jitter, pip.opacity_jitter), 0.0, 1.0)
+    jx = rng.uniform(-pip.position_jitter, pip.position_jitter)
+    jy = rng.uniform(-pip.position_jitter, pip.position_jitter)
+    size = _clamp(pip.size + rng.uniform(-pip.size_jitter, pip.size_jitter), 0.05, 0.8)
+    interval = _clamp(photos.interval + rng.uniform(-photos.interval_jitter, photos.interval_jitter), 0.2, 120.0)
+    hold_ms = _clamp(photos.hold_ms + rng.uniform(-photos.hold_jitter_ms, photos.hold_jitter_ms), 40.0, 5000.0)
+    phase_span = min(0.5, max(0.0, photos.interval_jitter))
+    phase = rng.uniform(0.0, phase_span) if phase_span > 0 else 0.0
+    return {
+        "pip_opacity": round(opacity, 5),
+        "pip_jx": round(jx, 5),
+        "pip_jy": round(jy, 5),
+        "pip_size": round(size, 5),
+        "photo_interval": round(interval, 5),
+        "photo_hold": round(hold_ms / 1000.0, 5),
+        "photo_phase": round(phase, 5),
+    }
+
+
+def photo_insert_times(main_duration: float, interval: float, phase: float) -> list[float]:
+    """Source-timeline points, after speed change, where a photo is inserted."""
+    if interval <= 0 or main_duration <= 0:
+        return []
+    times: list[float] = []
+    cursor = interval + max(0.0, phase)
+    guard = 0
+    while cursor < main_duration - 0.05 and guard < 500:
+        times.append(round(cursor, 3))
+        cursor += interval
+        guard += 1
+    return times
+
+
+def locate_output_time(output_t: float, main_duration: float, inserts: list[float], hold: float):
+    """Map an output timestamp to main content or a photo insert."""
+    output_t = max(0.0, output_t)
+    source = 0.0
+    elapsed = 0.0
+    for index, point in enumerate(inserts):
+        span = max(0.0, point - source)
+        if output_t <= elapsed + span + 1e-4:
+            return "main", source + max(0.0, output_t - elapsed)
+        elapsed += span
+        if output_t <= elapsed + hold + 1e-4:
+            return "photo", (index, max(0.0, output_t - elapsed))
+        elapsed += hold
+        source = point
+    tail = source + max(0.0, output_t - elapsed)
+    return "main", min(main_duration, tail)
+
+
+def output_duration(main_duration: float, inserts: list[float], hold: float) -> float:
+    return main_duration + len(inserts) * hold
+
+
+def render_photo_frame(ffmpeg: str, photo: str, width: int, height: int, hold: float,
+                       local: float, fade: float, output: Path) -> None:
+    width, height = _even(width), _even(height)
+    local = min(max(0.0, local), max(0.0, hold - 0.02))
+    fade = min(max(0.0, fade), max(0.0, hold / 2 - 0.02))
+    fade_filter = ""
+    if fade > 0.01:
+        fade_filter = f",fade=t=in:st=0:d={fade:.3f},fade=t=out:st={max(fade, hold - fade):.3f}:d={fade:.3f}"
+    video_filter = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p{fade_filter}"
+    )
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-loop", "1", "-i", str(photo),
+               "-vf", video_filter, "-ss", f"{local:.3f}", "-frames:v", "1", "-an", str(output)]
+    _run(command, "照片预览失败")
+
+
 def _needs_forced_verify(options: ProcessOptions, sampled: dict) -> bool:
     speed = sampled.get("speed")
-    return options.drop_enabled or (speed is not None and abs(speed - 1) > 1e-3)
+    return options.drop_enabled or options.photos.enabled or (speed is not None and abs(speed - 1) > 1e-3)
+
+
+def _validate_pip(pip: PipSpec) -> None:
+    if not pip.enabled:
+        return
+    if pip.position not in PIP_POSITIONS:
+        raise ValueError("画中画位置无效")
+    if pip.short_mode not in {"loop", "hold"}:
+        raise ValueError("画中画短片方式无效")
+    if not pip.path or not Path(pip.path).is_file():
+        raise ValueError("请选择存在的画中画视频")
+    if not 0.05 <= pip.size <= 0.8:
+        raise ValueError("画中画尺寸必须是画面宽度的 5%～80%")
+    if not 0.0 <= pip.opacity <= 1.0 or not 0.0 <= pip.opacity_jitter <= 0.5:
+        raise ValueError("画中画透明度或浮动超出范围")
+    if not 0.0 <= pip.position_jitter <= 0.2 or not 0.0 <= pip.size_jitter <= 0.2:
+        raise ValueError("画中画位置或尺寸浮动超出范围")
+    if not 0.0 <= pip.audio_percent <= 100.0:
+        raise ValueError("画中画音量必须在 0～100% 之间")
+    if pip.start < 0 or (pip.end > 0 and pip.end <= pip.start):
+        raise ValueError("画中画出现时间无效")
+
+
+def _validate_photos(spec: PhotoInsertSpec) -> None:
+    if not spec.enabled:
+        return
+    if not spec.paths:
+        raise ValueError("请至少添加一张照片")
+    allowed = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    for raw in spec.paths:
+        path = Path(raw)
+        if not path.is_file():
+            raise ValueError(f"找不到照片: {raw}")
+        if path.suffix.lower() not in allowed:
+            raise ValueError(f"照片格式不支持: {path.name}")
+    if not 0.2 <= spec.interval <= 120:
+        raise ValueError("插入间隔必须在 0.2～120 秒之间")
+    if not 0.0 <= spec.interval_jitter <= 30:
+        raise ValueError("间隔浮动超出范围")
+    if not 40 <= spec.hold_ms <= 5000:
+        raise ValueError("照片停留时间必须在 40～5000 毫秒之间")
+    if not 0.0 <= spec.hold_jitter_ms <= 2000:
+        raise ValueError("停留浮动超出范围")
+    if not 0.0 <= spec.fade_ms <= 2000:
+        raise ValueError("淡入淡出必须在 0～2000 毫秒之间")
+    if spec.hold_jitter_ms == 0 and spec.fade_ms * 2 >= spec.hold_ms:
+        raise ValueError("淡入淡出需要短于停留时间的一半")
+
+
+def _pip_active(pip: PipSpec, preview_time: float | None) -> bool:
+    if not pip.enabled or not pip.path:
+        return False
+    return _time_active(pip.start, pip.end, preview_time)
+
+
+def _pip_overlay(pip: PipSpec, variation: dict, current: str, width: int, height: int,
+                 main_duration: float, preview_time: float | None, input_index: int,
+                 time_scale: float = 1.0):
+    opacity = variation["pip_opacity"]
+    size = variation["pip_size"]
+    pip_w = _even(max(32, round(width * size)))
+    scale = time_scale if time_scale > 1e-6 else 1.0
+    # 静帧没有变速，时间按原片；成片里的出现时间要换到变速之后的时间轴。
+    if preview_time is None:
+        start = max(0.0, pip.start) / scale
+        end = pip.end / scale if pip.end > 0 else main_duration
+    else:
+        start = max(0.0, pip.start)
+        end = pip.end if pip.end > 0 else main_duration
+    visible = max(0.08, end - start)
+    jx = int(round(variation["pip_jx"] * width))
+    jy = int(round(variation["pip_jy"] * height))
+    margin = max(0, int(round(0.03 * width)))
+    x_expr, y_expr = _pip_xy(pip.position, margin, jx, jy)
+    seek = None
+    if preview_time is None:
+        extend = ""
+        if pip.short_mode == "hold":
+            extend = f",tpad=stop_mode=clone:stop_duration={visible + 0.5:.3f}"
+        delay = f",setpts=PTS-STARTPTS+{start:.3f}/TB" if start > 0.001 else ",setpts=PTS-STARTPTS"
+        prepared = (
+            f"[{input_index}:v]scale={pip_w}:-2,format=rgba,colorchannelmixer=aa={opacity:.4f}"
+            f"{extend},trim=duration={visible:.3f}{delay}[pipv]"
+        )
+        enable = f":enable='between(t,{start:.3f},{end:.3f})'" if start > 0.001 or pip.end > 0 else ""
+        kind = "pip_loop" if pip.short_mode != "hold" else "pip_hold"
+    else:
+        seek = max(0.0, preview_time - start)
+        prepared = (
+            f"[{input_index}:v]scale={pip_w}:-2,format=rgba,colorchannelmixer=aa={opacity:.4f},"
+            f"trim=duration=0.08[pipv]"
+        )
+        enable = ""
+        kind = "pip_hold"
+    segment = f"{prepared};[{current}][pipv]overlay=x={x_expr}:y={y_expr}:eof_action=pass{enable}[pipout]"
+    audio = None
+    if pip.audio_percent > 0 and preview_time is None:
+        audio = {"index": input_index, "start": start, "visible": visible,
+                 "volume": pip.audio_percent / 100.0, "path": pip.path}
+    return segment, (kind, pip.path, seek), audio
+
+
+def _pip_xy(position: str, margin: int, jx: int, jy: int) -> tuple[str, str]:
+    if position == "tl":
+        return _shift(str(margin), jx), _shift(str(margin), jy)
+    if position == "tr":
+        return _shift(f"W-w-{margin}", jx), _shift(str(margin), jy)
+    if position == "bl":
+        return _shift(str(margin), jx), _shift(f"H-h-{margin}", jy)
+    if position == "br":
+        return _shift(f"W-w-{margin}", jx), _shift(f"H-h-{margin}", jy)
+    return _shift("(W-w)/2", jx), _shift("(H-h)/2", jy)
+
+
+def _shift(base: str, pixels: int) -> str:
+    if pixels == 0:
+        return base
+    sign = "+" if pixels > 0 else "-"
+    return f"{base}{sign}{abs(pixels)}"
+
+
+def _mix_pip_audio(segments: list[str], plan: FilterPlan, audio: dict, audio_count: int, main_duration: float) -> None:
+    if not _media_has_audio(audio["path"]):
+        plan.parameters["pip_audio"] = "叠加视频没有音轨，已按静音处理"
+        return
+    delay = ""
+    if audio["start"] > 0.001:
+        milliseconds = int(round(audio["start"] * 1000))
+        delay = f",adelay={milliseconds}|{milliseconds}"
+    segments.append(
+        f"[{audio['index']}:a]atrim=0:{audio['visible']:.3f},asetpts=PTS-STARTPTS,"
+        f"volume={audio['volume']:.4f}{delay},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[pipa]"
+    )
+    if plan.aout or audio_count:
+        base = plan.aout or "0:a:0"
+        segments.append(f"[{base}]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[pipbase]")
+        segments.append("[pipbase][pipa]amix=inputs=2:duration=first:normalize=0[pipmix]")
+        plan.aout = "pipmix"
+        plan.map_source_audio = False
+    else:
+        segments.append(f"[pipa]apad,atrim=0:{max(0.1, main_duration):.3f}[pipmix]")
+        plan.aout = "pipmix"
+    plan.has_audio = True
+
+
+def _insert_photos(segments: list[str], plan: FilterPlan, spec: PhotoInsertSpec, times: list[float],
+                   variation: dict, width: int, height: int, main_duration: float, fps: float,
+                   want_audio: bool) -> None:
+    hold = max(0.04, variation["photo_hold"])
+    fade = min(spec.fade_ms / 1000.0, max(0.0, hold / 2 - 0.02))
+    fps_i = int(round(fps)) if fps > 1 else 25
+    if fps_i not in {24, 25, 30, 50, 60}:
+        fps_i = 25
+    width, height = _even(width), _even(height)
+    count = len(times)
+    bounds = [0.0, *times, main_duration]
+    split_labels = "".join(f"[ms{i}]" for i in range(count + 1))
+    segments.append(f"[{plan.vout}]fps={fps_i},setsar=1,format=yuv420p,split={count + 1}{split_labels}")
+    for index in range(count + 1):
+        segments.append(
+            f"[ms{index}]trim=start={bounds[index]:.3f}:end={bounds[index + 1]:.3f},setpts=PTS-STARTPTS[mv{index}]"
+        )
+    sequence = [spec.paths[index % len(spec.paths)] for index in range(count)]
+    order: list[str] = []
+    uses: dict[str, int] = {}
+    for path in sequence:
+        uses[path] = uses.get(path, 0) + 1
+        if path not in order:
+            order.append(path)
+    labels: dict[str, list[str]] = {}
+    for path_index, path in enumerate(order):
+        input_index = 1 + len(plan.extra_inputs)
+        plan.extra_inputs.append(("photo", path))
+        fade_filter = ""
+        if fade > 0.01:
+            fade_filter = f",fade=t=in:st=0:d={fade:.3f},fade=t=out:st={max(fade, hold - fade):.3f}:d={fade:.3f}"
+        prepared = (
+            f"[{input_index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps_i},format=yuv420p,"
+            f"trim=duration={hold:.3f}{fade_filter},setpts=PTS-STARTPTS"
+        )
+        names = [f"ph{path_index}_{slot}" for slot in range(uses[path])]
+        if uses[path] == 1:
+            segments.append(f"{prepared}[{names[0]}]")
+        else:
+            segments.append(f"{prepared},split={uses[path]}" + "".join(f"[{name}]" for name in names))
+        labels[path] = names
+    cursor = {path: 0 for path in order}
+    photo_labels = []
+    for path in sequence:
+        photo_labels.append(labels[path][cursor[path]])
+        cursor[path] += 1
+    use_audio = want_audio and (plan.aout or plan.map_source_audio or plan.has_audio)
+    if use_audio:
+        base = plan.aout or "0:a:0"
+        audio_labels = "".join(f"[ma{i}]" for i in range(count + 1))
+        segments.append(
+            f"[{base}]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asplit={count + 1}{audio_labels}"
+        )
+        for index in range(count + 1):
+            segments.append(
+                f"[ma{index}]atrim=start={bounds[index]:.3f}:end={bounds[index + 1]:.3f},asetpts=PTS-STARTPTS[mc{index}]"
+            )
+        silence = (
+            f"anullsrc=r=48000:cl=stereo,atrim=duration={hold:.3f},asetpts=PTS-STARTPTS"
+        )
+        if count == 1:
+            segments.append(f"{silence}[sil0]")
+        else:
+            segments.append(f"{silence},asplit={count}" + "".join(f"[sil{i}]" for i in range(count)))
+        pieces = []
+        for index, photo_label in enumerate(photo_labels):
+            pieces.extend((f"[mv{index}]", f"[mc{index}]", f"[{photo_label}]", f"[sil{index}]"))
+        pieces.extend((f"[mv{count}]", f"[mc{count}]"))
+        segments.append("".join(pieces) + f"concat=n={count * 2 + 1}:v=1:a=1[catv][cata]")
+        plan.vout = "catv"
+        plan.aout = "cata"
+        plan.map_source_audio = False
+        plan.has_audio = True
+        return
+    pieces = []
+    for index, photo_label in enumerate(photo_labels):
+        pieces.extend((f"[mv{index}]", f"[{photo_label}]"))
+    pieces.append(f"[mv{count}]")
+    segments.append("".join(pieces) + f"concat=n={count * 2 + 1}:v=1:a=0[catv]")
+    plan.vout = "catv"
+    plan.has_audio = False
+    plan.map_source_audio = False
+    plan.aout = ""
+
+
+def _media_has_audio(path: str) -> bool:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return True
+    try:
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30, creationflags=_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if proc.returncode:
+        return True
+    return bool((proc.stdout or "").strip())
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(high, max(low, value))
 
 
 def _output_size(width: int, height: int, options: ProcessOptions, sampled: dict) -> tuple[int, int]:
