@@ -37,6 +37,50 @@ class PreviewTests(unittest.TestCase):
         self.assertTrue(visual_effects(prepared))
         self.assertFalse(visual_effects(ProcessOptions()))
 
+    def test_mask_end_zero_lasts_until_the_video_ends(self):
+        from yingxu.models import MaskSpec
+        from yingxu.processing import build_plan, sample_options
+        media = {"width": 320, "height": 180, "duration": 10.0, "fps": 25.0,
+                 "video": {"index": 0}, "audio_count": 0}
+        open_ended = ProcessOptions(masks=(MaskSpec(mode="blur", x=0, y=0.7, w=1, h=0.2,
+                                                    blur=8, feather=0, start=1, end=0),))
+        graph = build_plan(open_ended, sample_options(open_ended, 1), media, seed=1).graph
+        self.assertIn("gblur", graph)
+        self.assertIn("gte(t,", graph)
+        self.assertNotIn("between(t,1.000,0.000)", graph)
+        late = build_plan(open_ended, sample_options(open_ended, 1), media, preview_time=8, include_audio=False, seed=1)
+        self.assertIn("gblur", late.graph)
+        early = build_plan(open_ended, sample_options(open_ended, 1), media, preview_time=0.2, include_audio=False, seed=1)
+        self.assertNotIn("gblur", early.graph)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "requires FFmpeg")
+    def test_default_logo_is_visible_at_the_builtin_size(self):
+        ffmpeg = shutil.which("ffmpeg")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "gray.mp4"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "color=c=0x808080:s=320x180:d=0.2",
+                            "-frames:v", "1", str(source)], check=True)
+            from yingxu.engine import probe_media
+            from yingxu.processing import DEFAULT_LOGO_OPACITY, DEFAULT_LOGO_SIZE
+            media = probe_media(source, shutil.which("ffprobe"))
+            plain = root / "plain.png"
+            marked = root / "logo.png"
+            extract_frame(ffmpeg, source, 0, plain)
+            render_still(ffmpeg, source, media, ProcessOptions(watermark=WatermarkSpec(
+                enabled=True, style="image", image=str(default_logo_path()),
+                size=DEFAULT_LOGO_SIZE, opacity=DEFAULT_LOGO_OPACITY, x=0.04, y=0.04,
+            )), 0, marked, 1, max_edge=0)
+            raw_plain = root / "a.raw"
+            raw_marked = root / "b.raw"
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(plain),
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw_plain)], check=True)
+            subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(marked),
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", str(raw_marked)], check=True)
+            difference = max(abs(a - b) for a, b in zip(raw_plain.read_bytes(), raw_marked.read_bytes()))
+            self.assertGreater(difference, 40)
+
     @unittest.skipUnless(shutil.which("ffmpeg"), "requires FFmpeg")
     def test_still_preview_shows_watermark_and_photo_insert(self):
         ffmpeg = shutil.which("ffmpeg")

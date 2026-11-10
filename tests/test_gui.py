@@ -39,6 +39,8 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(window.wm_text.text(), "影序")
             window.wm_style.setCurrentIndex(window.wm_style.findData("image"))
             self.assertTrue(window.wm_image.text().endswith("default_logo.png"))
+            self.assertGreaterEqual(window.wm_size.value(), 120)
+            self.assertGreaterEqual(window.wm_opacity.value(), 0.6)
             window.wm_enabled.setChecked(False)
             self.assertGreaterEqual(window.minimumWidth(), 960)
             self.assertGreaterEqual(window.minimumHeight(), 640)
@@ -69,7 +71,58 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertEqual(window.task_table.rowCount(), 2)
             self.assertEqual(window.task_table.item(0, 2).text(), "等待中")
         finally:
+            self._stop(window)
             window.close()
+
+    def test_later_mask_updates_a_saved_clip_and_end_zero_is_kept(self) -> None:
+        window = MainWindow()
+        try:
+            root = Path(tempfile.mkdtemp())
+            source = root / "素材.mp4"
+            source.write_bytes(b"placeholder")
+            window.output_edit.setText(str(root / "导出"))
+            window._add_paths([str(source)])
+            window.save_override()
+            self.assertEqual(window._options_for(source.resolve()).masks, ())
+            window._applying_mask = True
+            window.mask_x.setValue(8)
+            window.mask_y.setValue(72)
+            window.mask_w.setValue(84)
+            window.mask_h.setValue(16)
+            window.mask_end.setValue(0)
+            window._applying_mask = False
+            window._save_box_as_mask()
+            masks = window._options_for(source.resolve()).masks
+            self.assertEqual(len(masks), 1)
+            self.assertEqual(masks[0].end, 0)
+            self.assertIn("蒙版1段", window.source_list.item(0).text())
+            window.mask_blur.setValue(9)
+            self.assertEqual(window._options_for(source.resolve()).masks[0].blur, 9)
+        finally:
+            window.close()
+
+    def test_start_enqueues_current_videos_when_the_queue_is_empty(self) -> None:
+        window = MainWindow()
+        try:
+            root = Path(tempfile.mkdtemp())
+            source = root / "素材.mp4"
+            source.write_bytes(b"placeholder")
+            window.output_edit.setText(str(root / "导出"))
+            window.versions.setValue(1)
+            window._add_paths([str(source)])
+            self.assertEqual(window.task_table.rowCount(), 0)
+            window.start_queue()
+            self.assertEqual(window.task_table.rowCount(), 1)
+            self.assertEqual(window.task_table.item(0, 0).text(), "素材.mp4")
+        finally:
+            self._stop(window)
+            window.close()
+
+    def _stop(self, window: MainWindow) -> None:
+        thread = window.thread
+        if thread and thread.isRunning():
+            thread.runner.cancel(list(window.tasks))
+            thread.wait(5000)
 
 
 if __name__ == "__main__":

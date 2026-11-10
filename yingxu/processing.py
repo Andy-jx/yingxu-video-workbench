@@ -396,6 +396,11 @@ def default_logo_path() -> Path:
     return Path(__file__).resolve().parent / "assets" / "default_logo.png"
 
 
+# 打开「图片 LOGO」时的默认组合。36px、透明度 0.30 叠在画面上几乎看不见。
+DEFAULT_LOGO_SIZE = 150
+DEFAULT_LOGO_OPACITY = 0.72
+
+
 def apply_default_logo(options: ProcessOptions) -> ProcessOptions:
     """Image watermarks with no file use the built-in logo, including export."""
     mark = options.watermark

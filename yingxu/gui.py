@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -24,7 +25,8 @@ from .models import (
     RangeSpec, WatermarkSpec, make_jobs, preset_dir,
 )
 from .processing import (
-    adjacent_source, apply_default_logo, default_logo_path, enabled_summary, extract_frame,
+    DEFAULT_LOGO_OPACITY, DEFAULT_LOGO_SIZE, adjacent_source, apply_default_logo, default_logo_path,
+    enabled_summary, extract_frame,
     find_cjk_font, list_video_encoders, load_profile, options_from_preset, prepare_preview_options,
     render_clip, render_still, risky_warnings, validate_against_media, validate_options,
     visual_effects, widget_rect_to_relative,
@@ -428,7 +430,11 @@ class MainWindow(QMainWindow):
         self.results: dict[str, dict] = {}
         self.masks: list[MaskSpec] = []
         self.photo_paths: list[str] = []
+        self.shared_masks: list[MaskSpec] = []
+        self.source_masks: dict[str, list[dict]] = {}
+        self.mask_target: str | None = None
         self._mask_preview = False
+        self._applying_mask = False
         self._last_live = 0.0
         self.thread: QueueThread | None = None
         self.preview_thread: PreviewThread | None = None
@@ -512,7 +518,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         title = QLabel("影序 · 视频处理工作台")
         title.setObjectName("title")
-        flow = QLabel("导入视频 → 设版本数、预设和导出目录 → 加入队列 → 开始处理")
+        flow = QLabel("导入视频 → 设版本和预设 → 开始处理")
         flow.setObjectName("muted")
         layout.addWidget(title)
         layout.addWidget(flow)
@@ -672,8 +678,8 @@ class MainWindow(QMainWindow):
         file_buttons.addWidget(self._button("导入视频", self.import_sources), 0, 0)
         file_buttons.addWidget(self._button("移除选中", self.remove_sources), 0, 1)
         file_buttons.addWidget(self._button("清空", self.clear_sources), 0, 2)
-        file_buttons.addWidget(self._button("设为单独参数", self.save_override), 1, 0, 1, 2)
-        file_buttons.addWidget(self._button("清除单独参数", self.clear_override), 1, 2)
+        file_buttons.addWidget(self._button("记住这条", self.save_override), 1, 0, 1, 2)
+        file_buttons.addWidget(self._button("取消记住", self.clear_override), 1, 2)
         top.addLayout(file_buttons)
         layout.addLayout(top)
 
@@ -767,7 +773,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(10, 10, 10, 10)
-        note = QLabel("镜像、旋转、抽帧默认关闭。未勾选的项目不会执行。正角度为顺时针。")
+        note = QLabel("勾上才生效，预览会马上变。镜像、旋转、抽帧默认关闭。")
         note.setObjectName("hint")
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -829,7 +835,7 @@ class MainWindow(QMainWindow):
         fps_row.addWidget(self.fps, 1)
         geo.addLayout(fps_row)
         layout.addWidget(geometry)
-        self.picture_warning = QLabel("变速会同步音频；抽帧会缩短视频。请先看预览。")
+        self.picture_warning = QLabel("变速会连音频一起变。抽帧会让视频变短。")
         self.picture_warning.setObjectName("warning")
         self.picture_warning.setWordWrap(True)
         layout.addWidget(self.picture_warning)
@@ -840,7 +846,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(10, 10, 10, 10)
-        note = QLabel("视频变速或抽帧时，音轨会用 atempo 按同一倍率处理，尽量保持音调。只处理第一条音轨。")
+        note = QLabel("变速、抽帧时声音会跟着变，并尽量保住音调。只处理第一条音轨。")
         note.setWordWrap(True)
         note.setObjectName("hint")
         layout.addWidget(note)
@@ -899,7 +905,7 @@ class MainWindow(QMainWindow):
         self.wm_enabled = QCheckBox("启用水印")
         self.wm_enabled.toggled.connect(self._watermark_toggled)
         layout.addWidget(self.wm_enabled)
-        note = QLabel("勾选或改参数后，中间预览会马上按当前时间重画。平铺建议透明度 0.15 左右。图片 LOGO 不选文件时使用内置标志，也可以自己换。")
+        note = QLabel("改完预览马上变。图片 LOGO 不选文件就用内置标志，也可以自己换。平铺把透明度降到 0.2 左右。")
         note.setWordWrap(True)
         note.setObjectName("hint")
         layout.addWidget(note)
@@ -930,6 +936,7 @@ class MainWindow(QMainWindow):
         self.wm_spacing = self._int_spin(40, 2000, 240)
         self.wm_start = self._double_spin(0, 86400, 0.1, 2, 0)
         self.wm_end = self._double_spin(0, 86400, 0.1, 2, 0)
+        self.wm_end.setSpecialValueText("到结尾")
         for widget in (self.wm_x, self.wm_y, self.wm_size, self.wm_opacity, self.wm_angle,
                        self.wm_speed, self.wm_spacing, self.wm_start, self.wm_end):
             widget.valueChanged.connect(self._on_form_changed)
@@ -954,7 +961,7 @@ class MainWindow(QMainWindow):
         font_row.addWidget(self._button("字体…", self.choose_font))
         layout.addLayout(font_row)
         self.font_edit.textChanged.connect(self._on_form_changed)
-        end_hint = QLabel("消失时间为 0 表示一直显示。速度单位是像素/秒。")
+        end_hint = QLabel("消失时间为 0，表示一直显示到结尾。")
         end_hint.setObjectName("hint")
         end_hint.setWordWrap(True)
         layout.addWidget(end_hint)
@@ -965,7 +972,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(10, 10, 10, 10)
-        warning = QLabel("暂停后在画面上拖动框选字幕，并设置时间段。框选后预览立刻显示模糊、复制或翻转。单条视频点「设为单独参数」。未点「添加蒙版」不会写入导出。复杂背景上这不是无痕修复。")
+        warning = QLabel("暂停后框选字幕，松开就加到当前视频，预览立刻能看到。结束时间 0 表示直到片尾。这是遮盖，不是无痕修复。")
         warning.setObjectName("warning")
         warning.setWordWrap(True)
         layout.addWidget(warning)
@@ -1011,6 +1018,7 @@ class MainWindow(QMainWindow):
         times = QHBoxLayout()
         self.mask_start = self._double_spin(0, 86400, 0.1, 2, 0)
         self.mask_end = self._double_spin(0, 86400, 0.1, 2, 0)
+        self.mask_end.setSpecialValueText("到结尾")
         self.mask_start.valueChanged.connect(self._on_mask_edited)
         self.mask_end.valueChanged.connect(self._on_mask_edited)
         times.addWidget(QLabel("开始"))
@@ -1037,7 +1045,7 @@ class MainWindow(QMainWindow):
         self.pip_enabled = QCheckBox("启用画中画")
         self.pip_enabled.toggled.connect(self._on_form_changed)
         pip.addWidget(self.pip_enabled)
-        note = QLabel("叠一段自己拍的视频。默认静音，不改变镜头顺序。未勾选或未选视频时不会写入命令。")
+        note = QLabel("叠一段自己的视频。默认没声音，不改变镜头顺序。不选视频就不会叠。")
         note.setWordWrap(True)
         note.setObjectName("hint")
         pip.addWidget(note)
@@ -1063,6 +1071,7 @@ class MainWindow(QMainWindow):
         self.pip_audio = self._double_spin(0, 100, 1, 0, 0)
         self.pip_start = self._double_spin(0, 86400, 0.1, 2, 0)
         self.pip_end = self._double_spin(0, 86400, 0.1, 2, 0)
+        self.pip_end.setSpecialValueText("到结尾")
         for widget in (self.pip_size, self.pip_opacity, self.pip_opacity_jitter, self.pip_position_jitter,
                        self.pip_size_jitter, self.pip_audio, self.pip_start, self.pip_end):
             widget.valueChanged.connect(self._on_form_changed)
@@ -1081,7 +1090,7 @@ class MainWindow(QMainWindow):
         self.pip_short.addItem("比主片短时停在尾帧", "hold")
         self.pip_short.currentIndexChanged.connect(self._on_form_changed)
         pip.addWidget(self.pip_short)
-        hint = QLabel("音量 0 表示静音，1 表示保留 1% 音量。结束为 0 表示直到主片结束。浮动让各版本略有差别，同一种子可复现。")
+        hint = QLabel("音量 0 是静音，1 是原音的 1%。结束为 0 表示放到片尾。")
         hint.setWordWrap(True)
         hint.setObjectName("hint")
         pip.addWidget(hint)
@@ -1092,7 +1101,7 @@ class MainWindow(QMainWindow):
         self.photo_enabled = QCheckBox("启用照片加帧")
         self.photo_enabled.toggled.connect(self._on_form_changed)
         photos.addWidget(self.photo_enabled)
-        warn = QLabel("把照片插进时间轴，成片会变长，镜头之间会多出这些画面。成片二次处理模式不可用。未勾选或没有照片时不会写入命令。")
+        warn = QLabel("照片会插进画面中间，成片变长。成片模式不能用。没照片就不会插。")
         warn.setWordWrap(True)
         warn.setObjectName("warning")
         photos.addWidget(warn)
@@ -1119,7 +1128,7 @@ class MainWindow(QMainWindow):
             photo_grid.addWidget(QLabel(label), index, 0)
             photo_grid.addWidget(widget, index, 1)
         photos.addLayout(photo_grid)
-        fit = QLabel("照片按画面居中适配，上下或左右留黑边，不拉伸。多张照片轮流插入。")
+        fit = QLabel("照片居中，多的地方留黑边，不拉伸。多张轮流插入。")
         fit.setWordWrap(True)
         fit.setObjectName("hint")
         photos.addWidget(fit)
@@ -1149,7 +1158,7 @@ class MainWindow(QMainWindow):
         self.encoder_preset.currentIndexChanged.connect(self._on_form_changed)
         quality.addWidget(self.encoder_preset, 1)
         layout.addLayout(quality)
-        self.codec_hint = QLabel("未检测到的编码器不会出现在列表里。NVENC 需要本机显卡，失败会记入该任务。")
+        self.codec_hint = QLabel("列表里没有的编码器，当前 FFmpeg 不支持。NVIDIA 需要本机显卡。")
         self.codec_hint.setWordWrap(True)
         self.codec_hint.setObjectName("hint")
         layout.addWidget(self.codec_hint)
@@ -1233,7 +1242,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 6, 8, 6)
         row = QHBoxLayout()
-        row.addWidget(QLabel("运行日志（同时写入 ~/.yingxu/logs）"))
+        row.addWidget(QLabel("运行日志"))
         row.addStretch()
         row.addWidget(self._button("清空日志", lambda: self.log_edit.setPlainText("")))
         layout.addLayout(row)
@@ -1374,16 +1383,25 @@ class MainWindow(QMainWindow):
             return
         style = self.wm_style.currentData()
         self._loading = True
-        if style == "image" and not self.wm_image.text().strip():
-            self.wm_image.setText(str(default_logo_path()))
+        if style == "image":
+            if not self.wm_image.text().strip():
+                self.wm_image.setText(str(default_logo_path()))
+            # 36 / 0.30 是文字水印的默认值，叠内置标志时几乎看不见。
+            if self.wm_size.value() <= 48 and self.wm_opacity.value() <= 0.35:
+                self.wm_size.setValue(DEFAULT_LOGO_SIZE)
+                self.wm_opacity.setValue(DEFAULT_LOGO_OPACITY)
         elif style not in {"image", "path"} and not self.wm_text.text().strip():
             self.wm_text.setText("影序")
         self._loading = False
 
     def _on_mask_edited(self, *_args) -> None:
-        if self._loading:
+        if self._loading or self._applying_mask:
             return
         self._mask_preview = True
+        row = self.mask_list.currentRow()
+        if 0 <= row < len(self.masks):
+            self.masks[row] = self._mask_from_form()
+            self._persist_current_masks()
         self._on_form_changed()
 
     def _roll_seed(self) -> None:
@@ -1660,12 +1678,18 @@ class MainWindow(QMainWindow):
     def _refresh_source_list(self) -> None:
         current = self.source_list.currentItem()
         current_path = current.data(Qt.UserRole) if current else None
+        self.source_list.blockSignals(True)
         self.source_list.clear()
         names = [path.name for path in self.sources]
         for path in self.sources:
             label = path.name if names.count(path.name) == 1 else f"{path.name}  —  {path.parent.name}"
+            tags = []
             if str(path) in self.overrides:
-                label += "  · 单独参数"
+                tags.append("单独设置")
+            if str(path) in self.source_masks:
+                tags.append(f"蒙版{len(self.source_masks[str(path)])}段")
+            if tags:
+                label += "  · " + " · ".join(tags)
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, str(path))
             item.setToolTip(str(path))
@@ -1674,6 +1698,7 @@ class MainWindow(QMainWindow):
                 self.source_list.setCurrentItem(item)
         if self.source_list.currentRow() < 0 and self.source_list.count():
             self.source_list.setCurrentRow(0)
+        self.source_list.blockSignals(False)
 
     def remove_sources(self) -> None:
         for item in list(self.source_list.selectedItems()):
@@ -1681,13 +1706,19 @@ class MainWindow(QMainWindow):
             if path in self.sources:
                 self.sources.remove(path)
             self.overrides.pop(str(path), None)
+            self.source_masks.pop(str(path), None)
             self.media.pop(str(path), None)
         self._refresh_source_list()
 
     def clear_sources(self) -> None:
         self.sources.clear()
         self.overrides.clear()
+        self.source_masks.clear()
+        self.shared_masks.clear()
+        self.masks.clear()
+        self.mask_target = None
         self.media.clear()
+        self._refresh_mask_list()
         self._refresh_source_list()
 
     def choose_output(self) -> None:
@@ -1864,7 +1895,9 @@ class MainWindow(QMainWindow):
         source = self._preview_source()
         if str(source) == getattr(self, "_last_source", None):
             return
+        self._persist_current_masks()
         self._last_source = str(source)
+        self._load_masks_for(source)
         self._stop_play()
         self.single_pane.release()
         self.cmp_left.release()
@@ -2151,7 +2184,7 @@ class MainWindow(QMainWindow):
         source = self._preview_source()
         info = self.media.get(str(source), {}) if source else {}
         if page == 3:
-            self._mask_preview = True
+            self._applying_mask = True
             self.mask_x.setValue(x * 100)
             self.mask_y.setValue(y * 100)
             self.mask_w.setValue(w * 100)
@@ -2161,8 +2194,8 @@ class MainWindow(QMainWindow):
             self.mask_sy.setValue(sy * 100)
             self.mask_sw.setValue(sw * 100)
             self.mask_sh.setValue(sh * 100)
-            self.preview_info.setText("已框选，预览会显示这块蒙版。设好时间段；单条视频点「设为单独参数」。未点「添加蒙版」不会写入导出。")
-            self._schedule_preview()
+            self._applying_mask = False
+            self._save_box_as_mask()
         elif page == 0 and self.crop_enabled.isChecked() and info:
             self.crop_x.setValue(int(x * info["width"]))
             self.crop_y.setValue(int(y * info["height"]))
@@ -2183,7 +2216,73 @@ class MainWindow(QMainWindow):
             blur=self.mask_blur.value(), start=self.mask_start.value(), end=self.mask_end.value(),
         )
 
+    def _source_key(self, source: Path | None) -> str | None:
+        if source is None:
+            return None
+        return str(source if source.is_absolute() else source.resolve())
+
+    def _attach_masks_to_source(self, source: Path) -> None:
+        key = self._source_key(source)
+        if key is None:
+            return
+        if key not in self.source_masks:
+            self.source_masks[key] = [mask.to_dict() for mask in self.masks] if self.mask_target is None else []
+            self.masks = [MaskSpec.from_dict(item) for item in self.source_masks[key]]
+        self.mask_target = key
+
+    def _persist_current_masks(self) -> None:
+        payload = [mask.to_dict() for mask in self.masks]
+        if self.mask_target:
+            self.source_masks[self.mask_target] = payload
+            if self.mask_target in self.overrides:
+                self.overrides[self.mask_target]["masks"] = payload
+        else:
+            self.shared_masks = list(self.masks)
+        self._refresh_source_list()
+
+    def _load_masks_for(self, source: Path | None) -> None:
+        key = self._source_key(source)
+        self._loading = True
+        if key and key in self.source_masks:
+            self.mask_target = key
+            self.masks = [MaskSpec.from_dict(item) for item in self.source_masks[key]]
+        else:
+            self.mask_target = None
+            self.masks = list(self.shared_masks)
+        self._refresh_mask_list()
+        if self.masks:
+            self.mask_list.setCurrentRow(0)
+        self._loading = False
+
+    def _save_box_as_mask(self) -> None:
+        source = self._preview_source()
+        if source is not None:
+            self._attach_masks_to_source(source)
+        try:
+            mask = self._mask_from_form()
+            validate_options(ProcessOptions(masks=(mask,)))
+        except ValueError as exc:
+            self.preview_info.setText(str(exc))
+            return
+        row = self.mask_list.currentRow()
+        if 0 <= row < len(self.masks):
+            self.masks[row] = mask
+        else:
+            self.masks.append(mask)
+            row = len(self.masks) - 1
+        self._persist_current_masks()
+        self._refresh_mask_list()
+        self._loading = True
+        self.mask_list.setCurrentRow(row)
+        self._loading = False
+        self._mask_preview = True
+        self.preview_info.setText("这块蒙版已加到当前视频。结束时间 0 表示直到片尾。")
+        self._on_form_changed()
+
     def add_mask(self) -> None:
+        source = self._preview_source()
+        if source is not None:
+            self._attach_masks_to_source(source)
         try:
             mask = self._mask_from_form()
             validate_options(ProcessOptions(masks=(mask,)))
@@ -2191,16 +2290,22 @@ class MainWindow(QMainWindow):
             self.show_error(str(exc))
             return
         self.masks.append(mask)
+        self._persist_current_masks()
         self._refresh_mask_list()
+        self._loading = True
         self.mask_list.setCurrentRow(len(self.masks) - 1)
+        self._loading = False
+        self._mask_preview = True
         self._on_form_changed()
-        self.write_log(f"已添加蒙版，当前 {len(self.masks)} 段")
+        self.write_log(f"已加上蒙版，当前这条 {len(self.masks)} 段")
 
     def update_mask(self) -> None:
+        if not self.masks:
+            self.add_mask()
+            return
         row = self.mask_list.currentRow()
         if row < 0:
-            self.show_error("请先在列表里选中一段蒙版。")
-            return
+            row = len(self.masks) - 1
         try:
             mask = self._mask_from_form()
             validate_options(ProcessOptions(masks=(mask,)))
@@ -2208,15 +2313,21 @@ class MainWindow(QMainWindow):
             self.show_error(str(exc))
             return
         self.masks[row] = mask
+        self._persist_current_masks()
         self._refresh_mask_list()
+        self._loading = True
         self.mask_list.setCurrentRow(row)
+        self._loading = False
         self._on_form_changed()
 
     def delete_mask(self) -> None:
         row = self.mask_list.currentRow()
+        if row < 0 and self.masks:
+            row = len(self.masks) - 1
         if row < 0:
             return
         del self.masks[row]
+        self._persist_current_masks()
         self._refresh_mask_list()
         self._on_form_changed()
 
@@ -2259,9 +2370,13 @@ class MainWindow(QMainWindow):
             self.show_error(str(exc))
             return
         for path in selected:
-            self.overrides[str(path)] = options.to_dict()
+            key = self._source_key(path)
+            payload = options.to_dict()
+            if key in self.source_masks:
+                payload["masks"] = self.source_masks[key]
+            self.overrides[key] = payload
         self._refresh_source_list()
-        self.write_log(f"已把当前参数单独设给 {len(selected)} 个素材。之后改右侧设置，不会再跟着变，除非清除。")
+        self.write_log(f"已记住 {len(selected)} 条自己的颜色和水印。之后改蒙版仍会写进这些条。")
 
     def clear_override(self) -> None:
         for path in self._selected_sources():
@@ -2284,10 +2399,18 @@ class MainWindow(QMainWindow):
         return list(self.sources)
 
     def _options_for(self, source: Path) -> ProcessOptions:
-        raw = self.overrides.get(str(source))
-        options = ProcessOptions.from_dict(raw) if raw else self.collect_options()
-        if self.mode == "film":
-            options = self._strip_film(options)
+        key = self._source_key(source)
+        raw = self.overrides.get(key)
+        if raw:
+            options = ProcessOptions.from_dict(raw)
+            if self.mode == "film":
+                options = self._strip_film(options)
+        else:
+            options = self.collect_options()
+        if key in self.source_masks:
+            options = replace(options, masks=tuple(MaskSpec.from_dict(item) for item in self.source_masks[key]))
+        elif raw is None:
+            options = replace(options, masks=tuple(self.shared_masks))
         validate_options(options)
         info = self.media.get(str(source))
         if info:
@@ -2428,8 +2551,10 @@ class MainWindow(QMainWindow):
             return
         pending = [spec for job_id, spec in self.tasks.items() if self.states[job_id] == "queued"]
         if not pending:
-            self.show_error("没有等待中的任务。请先导入视频并加入队列。")
-            return
+            self.enqueue_sources()
+            pending = [spec for job_id, spec in self.tasks.items() if self.states[job_id] == "queued"]
+            if not pending:
+                return
         try:
             resolve_executable(self._ffmpeg_path(), "ffmpeg")
             resolve_executable(self._ffprobe_path(), "ffprobe")
